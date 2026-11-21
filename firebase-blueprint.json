@@ -1,0 +1,210 @@
+{
+  "entities": {
+    "UserWorkspaceProfile": {
+      "title": "UserWorkspaceProfile",
+      "description": "Public/workspace preferences for an authenticated LOODY user (PII is isolated in private subcollection).",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "language": { "type": "string", "enum": ["en", "ar"] },
+        "theme": { "type": "string", "enum": ["dark", "light", "system"] },
+        "accentColor": { "type": "string", "enum": ["emerald", "teal", "mint", "slate"] },
+        "fontSize": { "type": "string", "enum": ["sm", "md", "lg"] },
+        "density": { "type": "string", "enum": ["comfortable", "compact"] },
+        "soundEnabled": { "type": "boolean" },
+        "reducedMotion": { "type": "boolean" },
+        "defaultModelId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "allowFallback": { "type": "boolean" },
+        "memoryEnabled": { "type": "boolean" },
+        "emailNotifications": { "type": "boolean" },
+        "usageAlerts": { "type": "boolean" },
+        "role": { "type": "string", "enum": ["user"] },
+        "plan": { "type": "string", "enum": ["free"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "displayName", "language", "theme", "accentColor", "fontSize", "density", "soundEnabled", "reducedMotion", "defaultModelId", "allowFallback", "memoryEnabled", "emailNotifications", "usageAlerts", "role", "plan", "createdAt", "updatedAt"]
+    },
+    "UserPrivateAccount": {
+      "title": "UserPrivateAccount",
+      "description": "Strictly owner-isolated PII record storing user email and auth metadata.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 160 },
+        "authProvider": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "email", "authProvider", "createdAt", "updatedAt"]
+    },
+    "Project": {
+      "title": "Project",
+      "description": "Dedicated workspace project with custom instructions, preferred model, and enabled tools.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "description": { "type": "string", "maxLength": 400 },
+        "instructions": { "type": "string", "maxLength": 4000 },
+        "preferredModelId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "enabledTools": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "name", "description", "instructions", "preferredModelId", "enabledTools", "createdAt", "updatedAt"]
+    },
+    "ProjectFile": {
+      "title": "ProjectFile",
+      "description": "Extracted text knowledge attachment scoped to a parent Project.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "mimeType": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "sizeBytes": { "type": "integer" },
+        "extractedText": { "type": "string", "maxLength": 32000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "projectId", "name", "mimeType", "sizeBytes", "extractedText", "createdAt"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "Synchronized chat thread owned by an authenticated user.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128 },
+        "folder": { "type": "string", "maxLength": 48 },
+        "pinned": { "type": "boolean" },
+        "archived": { "type": "boolean" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "modelId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "projectId", "folder", "pinned", "archived", "title", "modelId", "createdAt", "updatedAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Single turn message inside a conversation.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "conversationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["user", "assistant"] },
+        "content": { "type": "string", "minLength": 1, "maxLength": 64000 },
+        "modelId": { "type": "string", "maxLength": 64 },
+        "provider": { "type": "string", "maxLength": 40 },
+        "inputTokens": { "type": "integer" },
+        "outputTokens": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "conversationId", "role", "content", "modelId", "provider", "inputTokens", "outputTokens", "createdAt"]
+    },
+    "ConversationShare": {
+      "title": "ConversationShare",
+      "description": "Explicitly published read-only conversation snapshot shareable via link.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "conversationId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "modelId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "active": { "type": "boolean" },
+        "transcript": { "type": "string", "minLength": 1, "maxLength": 100000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "conversationId", "title", "modelId", "active", "transcript", "createdAt", "updatedAt"]
+    },
+    "WorkspaceFile": {
+      "title": "WorkspaceFile",
+      "description": "Uploaded user document/text file stored cleanly in the user's Files registry.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "mimeType": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "sizeBytes": { "type": "integer" },
+        "extractedText": { "type": "string", "maxLength": 32000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "name", "mimeType", "sizeBytes", "extractedText", "createdAt"]
+    },
+    "UserMemory": {
+      "title": "UserMemory",
+      "description": "Owner-isolated long-term user or project-scoped memory entry controlled by user approval.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128 },
+        "scope": { "type": "string", "enum": ["user", "conversation", "project", "knowledge", "task", "operational"] },
+        "category": { "type": "string", "enum": ["preference", "fact", "instruction"] },
+        "content": { "type": "string", "minLength": 1, "maxLength": 1200 },
+        "approved": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "projectId", "scope", "category", "content", "approved", "createdAt", "updatedAt"]
+    },
+    "KnowledgeSource": {
+      "title": "KnowledgeSource",
+      "description": "Indexed knowledge metadata chunk owned by a user for semantic and lexical RAG grounding.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "sourceType": { "type": "string", "enum": ["workspace_file", "project_file", "memory"] },
+        "chunkCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "projectId", "title", "sourceType", "chunkCount", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserWorkspaceProfile" },
+      "description": "User workspace preferences and display metadata (non-PII)."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateAccount" },
+      "description": "Owner-isolated PII account record (email and auth provider)."
+    },
+    "/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/Project" },
+      "description": "User-owned LOODY projects with instructions and preferred model."
+    },
+    "/projects/{projectId}/files/{fileId}": {
+      "schema": { "$ref": "#/entities/ProjectFile" },
+      "description": "Extracted knowledge files scoped to a parent project."
+    },
+    "/conversations/{conversationId}": {
+      "schema": { "$ref": "#/entities/Conversation" },
+      "description": "User-owned chat conversations with folder, pin, and archive state."
+    },
+    "/conversations/{conversationId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Synchronized chat turns scoped to a parent conversation."
+    },
+    "/shares/{shareId}": {
+      "schema": { "$ref": "#/entities/ConversationShare" },
+      "description": "Explicitly published read-only conversation snapshots."
+    },
+    "/user_files/{fileId}": {
+      "schema": { "$ref": "#/entities/WorkspaceFile" },
+      "description": "User workspace uploaded documents and text extracts."
+    },
+    "/user_memories/{memoryId}": {
+      "schema": { "$ref": "#/entities/UserMemory" },
+      "description": "Owner-isolated user and project memories controlled by user approval."
+    },
+    "/knowledge_sources/{sourceId}": {
+      "schema": { "$ref": "#/entities/KnowledgeSource" },
+      "description": "Owner-isolated indexed RAG knowledge source references."
+    }
+  }
+}

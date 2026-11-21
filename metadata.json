@@ -1,0 +1,6 @@
+{
+  "name": "LOODY — AI Super Workspace",
+  "description": "Your AI. Your Workspace. Multi-model AI workspace with synchronized model routing, token accounting, projects, and permission-controlled MCP tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

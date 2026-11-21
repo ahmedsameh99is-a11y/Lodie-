@@ -1,0 +1,367 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Validation Blueprints (Anti-Update-Gap)
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'ownerId', 'displayName', 'language', 'theme', 'accentColor',
+          'fontSize', 'density', 'soundEnabled', 'reducedMotion',
+          'defaultModelId', 'allowFallback', 'role', 'plan', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'displayName', 'language', 'theme', 'accentColor',
+          'fontSize', 'density', 'soundEnabled', 'reducedMotion',
+          'defaultModelId', 'allowFallback', 'role', 'plan', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.language in ['en', 'ar']
+        && data.theme in ['dark', 'light', 'system']
+        && data.accentColor in ['emerald', 'teal', 'mint', 'slate']
+        && data.fontSize in ['sm', 'md', 'lg']
+        && data.density in ['comfortable', 'compact']
+        && data.soundEnabled is bool
+        && data.reducedMotion is bool
+        && data.defaultModelId is string && data.defaultModelId.size() >= 1 && data.defaultModelId.size() <= 64
+        && data.allowFallback is bool
+        && data.role == 'user'
+        && data.plan == 'free'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivate(data) {
+      return data.keys().hasAll(['ownerId', 'email', 'authProvider', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'email', 'authProvider', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+        && data.authProvider is string && data.authProvider.size() >= 1 && data.authProvider.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll([
+          'ownerId', 'name', 'description', 'instructions',
+          'preferredModelId', 'enabledTools', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'name', 'description', 'instructions',
+          'preferredModelId', 'enabledTools', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.description is string && data.description.size() <= 400
+        && data.instructions is string && data.instructions.size() <= 4000
+        && data.preferredModelId is string && data.preferredModelId.size() >= 1 && data.preferredModelId.size() <= 64
+        && data.enabledTools is list
+        && data.enabledTools.size() <= 16
+        && (data.enabledTools.size() == 0 || data.enabledTools[0] is string)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProjectFile(data, projectId) {
+      return data.keys().hasAll([
+          'ownerId', 'projectId', 'name', 'mimeType', 'sizeBytes', 'extractedText', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'projectId', 'name', 'mimeType', 'sizeBytes', 'extractedText', 'createdAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && isValidId(data.projectId)
+        && data.projectId == projectId
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.mimeType is string && data.mimeType.size() >= 1 && data.mimeType.size() <= 80
+        && data.sizeBytes is int && data.sizeBytes >= 0 && data.sizeBytes <= 10485760
+        && data.extractedText is string && data.extractedText.size() <= 32000
+        && data.createdAt is timestamp;
+    }
+
+    function isValidConversation(data) {
+      return data.keys().hasAll([
+          'ownerId', 'projectId', 'folder', 'pinned', 'archived',
+          'title', 'modelId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'projectId', 'folder', 'pinned', 'archived',
+          'title', 'modelId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.projectId is string && data.projectId.size() <= 128
+        && data.folder is string && data.folder.size() <= 48
+        && data.pinned is bool
+        && data.archived is bool
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+        && data.modelId is string && data.modelId.size() >= 1 && data.modelId.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidChatMessage(data, conversationId) {
+      return data.keys().hasAll([
+          'ownerId', 'conversationId', 'role', 'content',
+          'modelId', 'provider', 'inputTokens', 'outputTokens', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'conversationId', 'role', 'content',
+          'modelId', 'provider', 'inputTokens', 'outputTokens', 'createdAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && isValidId(data.conversationId)
+        && data.conversationId == conversationId
+        && data.role in ['user', 'assistant']
+        && data.content is string && data.content.size() >= 1 && data.content.size() <= 64000
+        && data.modelId is string && data.modelId.size() <= 64
+        && data.provider is string && data.provider.size() <= 40
+        && data.inputTokens is int && data.inputTokens >= 0
+        && data.outputTokens is int && data.outputTokens >= 0
+        && data.createdAt is timestamp;
+    }
+
+    function isValidShare(data) {
+      return data.keys().hasAll([
+          'ownerId', 'conversationId', 'title', 'modelId', 'active', 'transcript', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'conversationId', 'title', 'modelId', 'active', 'transcript', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && isValidId(data.conversationId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+        && data.modelId is string && data.modelId.size() >= 1 && data.modelId.size() <= 64
+        && data.active is bool
+        && data.transcript is string && data.transcript.size() >= 1 && data.transcript.size() <= 100000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkspaceFile(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'mimeType', 'sizeBytes', 'extractedText', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'mimeType', 'sizeBytes', 'extractedText', 'createdAt'])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.mimeType is string && data.mimeType.size() >= 1 && data.mimeType.size() <= 80
+        && data.sizeBytes is int && data.sizeBytes >= 0 && data.sizeBytes <= 10485760
+        && data.extractedText is string && data.extractedText.size() <= 32000
+        && data.createdAt is timestamp;
+    }
+
+    // Users Workspace Preferences (Non-PII)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isValidId(userId)
+        && isVerifiedUser()
+        && isOwner(userId)
+        && isValidUserProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isVerifiedUser()
+        && isOwner(userId)
+        && isValidUserProfile(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().role == existing().role
+        && incoming().plan == existing().plan
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName', 'language', 'theme', 'accentColor', 'fontSize',
+          'density', 'soundEnabled', 'reducedMotion', 'defaultModelId',
+          'allowFallback', 'updatedAt'
+        ]);
+      allow delete: if isValidId(userId) && isVerifiedUser() && isOwner(userId);
+
+      // Strictly Owner-Isolated PII Subcollection
+      match /private/{docId} {
+        allow get: if isValidId(userId) && isValidId(docId) && isOwner(userId);
+        allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(docId)
+          && isVerifiedUser()
+          && isOwner(userId)
+          && isValidUserPrivate(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId)
+          && isValidId(docId)
+          && isVerifiedUser()
+          && isOwner(userId)
+          && isValidUserPrivate(incoming())
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'authProvider', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(docId) && isVerifiedUser() && isOwner(userId);
+      }
+    }
+
+    // Projects & Master-Gated Project Files
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isValidId(projectId)
+        && isVerifiedUser()
+        && isValidProject(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(projectId)
+        && isVerifiedUser()
+        && existing().ownerId == request.auth.uid
+        && isValidProject(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'description', 'instructions', 'preferredModelId', 'enabledTools', 'updatedAt'
+          ])
+        );
+      allow delete: if isValidId(projectId) && isVerifiedUser() && existing().ownerId == request.auth.uid;
+
+      match /files/{fileId} {
+        allow get: if isValidId(projectId)
+          && isValidId(fileId)
+          && isSignedIn()
+          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+        allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(projectId)
+          && isValidId(fileId)
+          && isVerifiedUser()
+          && isValidProjectFile(incoming(), projectId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/projects/$(projectId))
+          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+        allow update: if false;
+        allow delete: if isValidId(projectId)
+          && isValidId(fileId)
+          && isVerifiedUser()
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+      }
+    }
+
+    // Conversations & Master-Gated Messages
+    match /conversations/{conversationId} {
+      allow get: if isValidId(conversationId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isValidId(conversationId)
+        && isVerifiedUser()
+        && isValidConversation(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(conversationId)
+        && isVerifiedUser()
+        && existing().ownerId == request.auth.uid
+        && isValidConversation(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['pinned', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['archived', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['folder', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['modelId', 'projectId', 'updatedAt'])
+        );
+      allow delete: if isValidId(conversationId) && isVerifiedUser() && existing().ownerId == request.auth.uid;
+
+      match /messages/{messageId} {
+        allow get: if isValidId(conversationId)
+          && isValidId(messageId)
+          && isSignedIn()
+          && get(/databases/$(database)/documents/conversations/$(conversationId)).data.ownerId == request.auth.uid;
+        allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(conversationId)
+          && isValidId(messageId)
+          && isVerifiedUser()
+          && isValidChatMessage(incoming(), conversationId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/conversations/$(conversationId))
+          && get(/databases/$(database)/documents/conversations/$(conversationId)).data.ownerId == request.auth.uid;
+        allow update: if false;
+        allow delete: if isValidId(conversationId)
+          && isValidId(messageId)
+          && isVerifiedUser()
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/conversations/$(conversationId)).data.ownerId == request.auth.uid;
+      }
+    }
+
+    // Permissioned Conversation Shares (Explicitly Shared Snapshots Only)
+    match /shares/{shareId} {
+      allow get: if isValidId(shareId)
+        && (existing().active == true || (isSignedIn() && existing().ownerId == request.auth.uid));
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isValidId(shareId)
+        && isVerifiedUser()
+        && isValidShare(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/conversations/$(incoming().conversationId))
+        && get(/databases/$(database)/documents/conversations/$(incoming().conversationId)).data.ownerId == request.auth.uid;
+      allow update: if isValidId(shareId)
+        && isVerifiedUser()
+        && existing().ownerId == request.auth.uid
+        && isValidShare(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().conversationId == existing().conversationId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'updatedAt']);
+      allow delete: if isValidId(shareId) && isVerifiedUser() && existing().ownerId == request.auth.uid;
+    }
+
+    // User Workspace Files
+    match /user_files/{fileId} {
+      allow get: if isValidId(fileId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isValidId(fileId)
+        && isVerifiedUser()
+        && isValidWorkspaceFile(incoming())
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(fileId) && isVerifiedUser() && existing().ownerId == request.auth.uid;
+    }
+  }
+}
