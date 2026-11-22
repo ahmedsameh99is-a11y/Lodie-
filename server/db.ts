@@ -547,6 +547,57 @@ function runMigrations() {
   );
 }
 
+export function evaluateProviderCredentials(params: {
+  provider: string;
+  hasEncryptedKey: boolean;
+  customBaseUrl?: string | null;
+}): { configured: boolean; configuredReason: string; missingReason: string } {
+  const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
+  const hasOpenAIKey = Boolean(process.env.OPENAI_API_KEY);
+  const hasAnthropicKey = Boolean(process.env.ANTHROPIC_API_KEY);
+
+  switch (params.provider) {
+    case 'gemini':
+      return {
+        configured: params.hasEncryptedKey || hasGeminiKey,
+        configuredReason: params.hasEncryptedKey
+          ? 'Configured via Developer Gemini API key (connectivity test pending)'
+          : 'Configured via server-side GEMINI_API_KEY adapter (connectivity test pending)',
+        missingReason: 'GEMINI_API_KEY not configured on server',
+      };
+    case 'openai-compatible':
+      return {
+        configured: params.hasEncryptedKey || hasOpenAIKey,
+        configuredReason: params.hasEncryptedKey
+          ? 'Configured via Developer OpenAI-compatible credentials (connectivity test pending)'
+          : 'Configured via OPENAI_API_KEY adapter (connectivity test pending)',
+        missingReason: 'Awaiting OPENAI_API_KEY or Developer provider config',
+      };
+    case 'anthropic-compatible':
+      return {
+        configured: params.hasEncryptedKey || hasAnthropicKey,
+        configuredReason: params.hasEncryptedKey
+          ? 'Configured via Developer Anthropic-compatible credentials (connectivity test pending)'
+          : 'Configured via ANTHROPIC_API_KEY adapter (connectivity test pending)',
+        missingReason: 'Awaiting ANTHROPIC_API_KEY or Developer provider config',
+      };
+    case 'hosted-oss': {
+      const hasBaseUrl = Boolean(process.env.HOSTED_OSS_BASE_URL || params.customBaseUrl);
+      return {
+        configured: hasBaseUrl,
+        configuredReason: 'Configured via Hosted OSS base URL (connectivity test pending)',
+        missingReason: 'Awaiting HOSTED_OSS_BASE_URL or custom base URL configuration',
+      };
+    }
+    default:
+      return {
+        configured: false,
+        configuredReason: '',
+        missingReason: `Unsupported provider adapter: ${params.provider}`,
+      };
+  }
+}
+
 function seedDefaults() {
   const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
   const hasOpenAIKey = Boolean(process.env.OPENAI_API_KEY);
@@ -569,9 +620,9 @@ function seedDefaults() {
       supports_tools: 1,
       supports_streaming: 1,
       pricing_summary: 'Included in Free Tier (subject to daily quota)',
-      availability: hasGeminiKey ? 'operational' : 'awaiting_config',
+      availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
-        ? 'Connected via server-side Gemini adapter'
+        ? 'Configured via server-side GEMINI_API_KEY adapter (connectivity test pending)'
         : 'GEMINI_API_KEY not configured on server',
       thinking_preset: 'MINIMAL',
     },
@@ -591,9 +642,9 @@ function seedDefaults() {
       supports_tools: 1,
       supports_streaming: 1,
       pricing_summary: 'Included in Free Tier (subject to daily quota)',
-      availability: hasGeminiKey ? 'operational' : 'awaiting_config',
+      availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
-        ? 'Connected via server-side Gemini adapter'
+        ? 'Configured via server-side GEMINI_API_KEY adapter (connectivity test pending)'
         : 'GEMINI_API_KEY not configured on server',
       thinking_preset: 'LOW',
     },
@@ -613,9 +664,9 @@ function seedDefaults() {
       supports_tools: 1,
       supports_streaming: 1,
       pricing_summary: 'Premium Plan & Developer Role',
-      availability: hasGeminiKey ? 'operational' : 'awaiting_config',
+      availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
-        ? 'Connected via server-side Gemini adapter (XHIGH reasoning preset)'
+        ? 'Configured via server-side GEMINI_API_KEY adapter (XHIGH reasoning preset; connectivity test pending)'
         : 'GEMINI_API_KEY not configured on server',
       thinking_preset: 'XHIGH',
     },
@@ -635,10 +686,11 @@ function seedDefaults() {
       supports_tools: 1,
       supports_streaming: 1,
       pricing_summary: 'Premium Plan & Developer Role (Provider-Configurable)',
-      availability: (hasAnthropicKey || hasOpenAIKey) ? 'operational' : 'awaiting_config',
-      availability_reason: (hasAnthropicKey || hasOpenAIKey)
-        ? 'Connected via external provider adapter'
-        : 'Awaiting OPENAI_API_KEY or ANTHROPIC_API_KEY (configurable by Developer)',
+      availability: hasAnthropicKey || hasOpenAIKey ? 'connected' : 'awaiting_config',
+      availability_reason:
+        hasAnthropicKey || hasOpenAIKey
+          ? 'Configured via external provider adapter (connectivity test pending)'
+          : 'Awaiting OPENAI_API_KEY or ANTHROPIC_API_KEY (configurable by Developer)',
       thinking_preset: 'HIGH',
     },
     {
@@ -657,9 +709,9 @@ function seedDefaults() {
       supports_tools: 1,
       supports_streaming: 1,
       pricing_summary: 'Multimodal Tier (Free preview quota / Premium extended)',
-      availability: hasGeminiKey ? 'operational' : 'awaiting_config',
+      availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
-        ? 'Connected via server-side Gemini Multimodal adapter'
+        ? 'Configured via server-side GEMINI_API_KEY Multimodal adapter (connectivity test pending)'
         : 'GEMINI_API_KEY not configured on server',
       thinking_preset: 'MEDIUM',
     },
@@ -682,38 +734,56 @@ function seedDefaults() {
     upsertModel.run(m);
   }
 
-  const existingModels = db.prepare('SELECT id, provider, encrypted_api_key, custom_base_url FROM model_registry').all() as Array<{
+  // Reconcile credential availability WITHOUT overwriting probe-derived availability/latency/error_class.
+  const existingModels = db
+    .prepare(
+      'SELECT id, provider, encrypted_api_key, custom_base_url, availability, last_tested_at, error_class FROM model_registry'
+    )
+    .all() as Array<{
     id: string;
     provider: string;
     encrypted_api_key: string | null;
     custom_base_url: string | null;
+    availability: string;
+    last_tested_at: string | null;
+    error_class: string | null;
   }>;
-  const updateAvail = db.prepare('UPDATE model_registry SET availability = ?, availability_reason = ? WHERE id = ?');
+
+  const setAwaitingConfig = db.prepare(
+    "UPDATE model_registry SET availability = 'awaiting_config', availability_reason = ?, error_class = 'configuration_error' WHERE id = ?"
+  );
+  const setConfiguredUntested = db.prepare(
+    "UPDATE model_registry SET availability = 'connected', availability_reason = ?, error_class = NULL, last_error_detail = NULL WHERE id = ?"
+  );
+  const healStaleUnavailable = db.prepare(
+    "UPDATE model_registry SET availability = 'temporarily_unavailable', availability_reason = ? WHERE id = ?"
+  );
+
   for (const row of existingModels) {
-    if (row.encrypted_api_key) continue;
-    if (row.provider === 'gemini') {
-      updateAvail.run(
-        hasGeminiKey ? 'operational' : 'awaiting_config',
-        hasGeminiKey ? 'Connected via server-side Gemini adapter' : 'GEMINI_API_KEY not configured on server',
-        row.id
-      );
-    } else if (row.provider === 'openai-compatible') {
-      updateAvail.run(
-        hasOpenAIKey ? 'operational' : 'awaiting_config',
-        hasOpenAIKey ? 'Connected via OpenAI-compatible adapter' : 'Awaiting OPENAI_API_KEY or Developer provider config',
-        row.id
-      );
-    } else if (row.provider === 'anthropic-compatible') {
-      updateAvail.run(
-        hasAnthropicKey ? 'operational' : 'awaiting_config',
-        hasAnthropicKey ? 'Connected via Anthropic-compatible adapter' : 'Awaiting ANTHROPIC_API_KEY or Developer provider config',
-        row.id
-      );
-    } else if (row.provider === 'hosted-oss') {
-      const hasOss = Boolean(process.env.HOSTED_OSS_BASE_URL || row.custom_base_url);
-      updateAvail.run(
-        hasOss ? 'operational' : 'awaiting_config',
-        hasOss ? 'Connected via Hosted OSS endpoint' : 'Awaiting HOSTED_OSS_BASE_URL configuration',
+    if (row.availability === 'disabled') continue;
+    const cred = evaluateProviderCredentials({
+      provider: row.provider,
+      hasEncryptedKey: Boolean(row.encrypted_api_key),
+      customBaseUrl: row.custom_base_url,
+    });
+
+    if (!cred.configured) {
+      if (row.availability !== 'awaiting_config' || row.error_class !== 'configuration_error') {
+        setAwaitingConfig.run(cred.missingReason, row.id);
+      }
+      continue;
+    }
+
+    // Credentials exist: never clobber real probe-derived states ('operational', 'slow', 'temporarily_unavailable', 'authentication_error', 'error').
+    if (row.availability === 'awaiting_config') {
+      setConfiguredUntested.run(cred.configuredReason, row.id);
+    } else if (row.availability === 'operational' && !row.last_tested_at) {
+      // Never treat an untested row as verified operational
+      setConfiguredUntested.run(cred.configuredReason, row.id);
+    } else if (row.availability === 'operational' && row.error_class) {
+      // Heal legacy rows where seedDefaults previously clobbered a failed probe back to 'operational'
+      healStaleUnavailable.run(
+        `Previous probe recorded ${row.error_class}; run health check to re-verify.`,
         row.id
       );
     }
@@ -981,6 +1051,7 @@ export function mapRowToBrandedModel(row: Record<string, unknown>): BrandedModel
     thinkingPreset: row.thinking_preset ? (String(row.thinking_preset) as BrandedModel['thinkingPreset']) : undefined,
     errorClass: row.error_class ? (String(row.error_class) as BrandedModel['errorClass']) : null,
     avgLatencyMs: row.avg_latency_ms !== null && row.avg_latency_ms !== undefined ? Number(row.avg_latency_ms) : null,
+    lastErrorDetail: row.last_error_detail ? String(row.last_error_detail) : null,
   };
 }
 

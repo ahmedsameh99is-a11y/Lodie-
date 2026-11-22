@@ -10,6 +10,7 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import type { BrandedModel } from '../shared/types';
+import { getModelStatusMeta } from '../shared/modelRegistry';
 import type { WorkspaceViewId } from './AppSidebar';
 
 interface HelpViewProps {
@@ -105,26 +106,33 @@ export const HelpView: React.FC<HelpViewProps> = ({ models, onNavigate }) => {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-100 dark:divide-white/5 text-zinc-800 dark:text-zinc-200">
-              {models.map((m) => (
-                <tr key={m.id}>
-                  <td className="py-2.5 pe-4 font-semibold">{m.displayName}</td>
-                  <td className="py-2.5 pe-4 uppercase font-mono text-[11px]">{m.requiredPlan}</td>
-                  <td className="py-2.5 pe-4 font-mono text-[11px] text-zinc-500">
-                    {m.provider} ({m.upstreamModelId})
-                  </td>
-                  <td className="py-2.5">
-                    <span
-                      className={
-                        m.availability === 'operational'
-                          ? 'text-emerald-600 dark:text-emerald-400 font-medium'
-                          : 'text-amber-600 dark:text-amber-400'
-                      }
-                    >
-                      {m.availability === 'operational' ? 'Operational' : 'Awaiting Provider Key'}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {models.map((m) => {
+                const statusMeta = getModelStatusMeta(m);
+                const statusToneClass =
+                  m.availability === 'operational'
+                    ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                    : m.availability === 'connected'
+                      ? 'text-sky-600 dark:text-sky-400 font-medium'
+                      : statusMeta.authError
+                        ? 'text-red-600 dark:text-red-400 font-medium'
+                        : statusMeta.disabled
+                          ? 'text-zinc-500 dark:text-zinc-400 font-medium'
+                          : 'text-amber-600 dark:text-amber-400 font-medium';
+                return (
+                  <tr key={m.id}>
+                    <td className="py-2.5 pe-4 font-semibold">{m.displayName}</td>
+                    <td className="py-2.5 pe-4 uppercase font-mono text-[11px]">{m.requiredPlan}</td>
+                    <td className="py-2.5 pe-4 font-mono text-[11px] text-zinc-500">
+                      {m.provider} ({m.upstreamModelId})
+                    </td>
+                    <td className="py-2.5">
+                      <span className={statusToneClass} title={m.availabilityReason}>
+                        {statusMeta.badgeLabel}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -168,7 +176,7 @@ export const HelpView: React.FC<HelpViewProps> = ({ models, onNavigate }) => {
           </div>
           <ul className="space-y-2 text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed list-disc ps-4">
             <li>
-              <strong className="text-zinc-900 dark:text-white">Model Awaiting Config:</strong> Lodie 5.5 or Fables 5.3 require server-side OpenAI or Anthropic credentials. Enable Automatic Model Fallback in Settings to route safely.
+              <strong className="text-zinc-900 dark:text-white">Model Status & Fallback:</strong> Models marked Awaiting Config (such as Fables 5.3 without a configured API key) require server-side credentials. Models experiencing upstream demand show Temporarily Unavailable; enable Automatic Model Fallback in Settings to route safely.
             </li>
             <li>
               <strong className="text-zinc-900 dark:text-white">Private Data Isolation:</strong> Every conversation, project, file, and memory record is filtered server-side by your authenticated session ID.

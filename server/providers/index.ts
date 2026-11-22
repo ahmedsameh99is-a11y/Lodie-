@@ -118,13 +118,46 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function createAttemptSignal(userSignal?: AbortSignal, timeoutMs = 45_000): AbortSignal {
+function createAttemptSignal(
+  userSignal?: AbortSignal,
+  timeoutMs = 25_000
+): { signal: AbortSignal; timeoutSignal: AbortSignal } {
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  if (!userSignal) return timeoutSignal;
+  if (!userSignal) return { signal: timeoutSignal, timeoutSignal };
   if (typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([userSignal, timeoutSignal]);
+    return { signal: AbortSignal.any([userSignal, timeoutSignal]), timeoutSignal };
   }
-  return userSignal;
+  return { signal: userSignal, timeoutSignal };
+}
+
+function normalizeTimeoutOrAbortError(params: {
+  err: unknown;
+  model: Pick<BrandedModel, 'displayName' | 'provider' | 'upstreamModelId'>;
+  timeoutMs: number;
+  userSignal?: AbortSignal;
+  timeoutSignal?: AbortSignal;
+}): ProviderExecutionError | null {
+  if (params.userSignal?.aborted) {
+    return null; // Caller intentionally aborted
+  }
+  const errName = (params.err as { name?: string })?.name;
+  const timedOut =
+    Boolean(params.timeoutSignal?.aborted) ||
+    errName === 'TimeoutError';
+
+  if (timedOut) {
+    const secs = Math.round(params.timeoutMs / 1000);
+    return new ProviderExecutionError(
+      `${params.model.displayName} timed out after ${secs}s waiting for ${params.model.provider}/${params.model.upstreamModelId}.`,
+      {
+        errorClass: 'latency',
+        healthStatus: 'temporarily_unavailable',
+        retryable: true,
+        httpStatus: 504,
+      }
+    );
+  }
+  return null;
 }
 
 export async function generateModelText(params: {
@@ -132,6 +165,8 @@ export async function generateModelText(params: {
   systemInstruction: string;
   prompt: string;
   thinkingPreset?: BrandedModel['thinkingPreset'];
+  timeoutMs?: number;
+  allowFallback?: boolean;
   signal?: AbortSignal;
 }): Promise<{
   text: string;
@@ -140,18 +175,20 @@ export async function generateModelText(params: {
   cachedTokens: number;
   latencyMs: number;
   modelUsed: string;
+  fallbackUsed?: boolean;
 }> {
   const ai = createGeminiClient();
   if (!ai) {
     throw new ProviderExecutionError('GEMINI_API_KEY is not configured on the server.', {
       errorClass: 'configuration_error',
-      healthStatus: 'configuration_error',
+      healthStatus: 'awaiting_config',
       retryable: false,
     });
   }
+  const timeoutMs = params.timeoutMs ?? 25_000;
   const requestedModel = params.upstreamModelId ?? 'gemini-4-hydrogen';
   const candidates =
-    requestedModel === 'gemini-4-hydrogen'
+    params.allowFallback !== false && requestedModel === 'gemini-4-hydrogen'
       ? ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
       : [requestedModel];
   const start = Date.now();
@@ -159,47 +196,66 @@ export async function generateModelText(params: {
 
   for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
     const modelId = candidates[cIdx];
-    const attempts = cIdx === 0 ? 2 : 1;
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      try {
-        const config: Record<string, unknown> = {
-          systemInstruction: params.systemInstruction,
-          abortSignal: params.signal,
+    const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(params.signal, timeoutMs);
+    try {
+      const config: Record<string, unknown> = {
+        systemInstruction: params.systemInstruction,
+        abortSignal: attemptSignal,
+      };
+      const level = mapThinkingLevel(params.thinkingPreset, modelId);
+      if (level) {
+        config.thinkingConfig = { thinkingLevel: level };
+      }
+      const resp = await ai.models.generateContent({
+        model: modelId,
+        contents: params.prompt,
+        config,
+      });
+      return {
+        text: (resp.text ?? '').trim(),
+        inputTokens: Number(resp.usageMetadata?.promptTokenCount ?? 0),
+        outputTokens: Number(resp.usageMetadata?.candidatesTokenCount ?? 0),
+        cachedTokens: Number(resp.usageMetadata?.cachedContentTokenCount ?? 0),
+        latencyMs: Date.now() - start,
+        modelUsed: modelId,
+        fallbackUsed: modelId !== requestedModel,
+      };
+    } catch (err) {
+      if (params.signal?.aborted) {
+        throw err;
+      }
+      const timed = normalizeTimeoutOrAbortError({
+        err,
+        model: { displayName: modelId, provider: 'gemini', upstreamModelId: modelId },
+        timeoutMs,
+        userSignal: params.signal,
+        timeoutSignal,
+      });
+      if (timed) {
+        lastInfo = {
+          message: timed.message,
+          status: 504,
+          cls: {
+            errorClass: timed.errorClass,
+            healthStatus: timed.healthStatus,
+            retryable: true,
+            userMessage: timed.message,
+          },
         };
-        const level = mapThinkingLevel(params.thinkingPreset, modelId);
-        if (level) {
-          config.thinkingConfig = { thinkingLevel: level };
-        }
-        const resp = await ai.models.generateContent({
-          model: modelId,
-          contents: params.prompt,
-          config,
-        });
-        return {
-          text: (resp.text ?? '').trim(),
-          inputTokens: Number(resp.usageMetadata?.promptTokenCount ?? 0),
-          outputTokens: Number(resp.usageMetadata?.candidatesTokenCount ?? 0),
-          cachedTokens: Number(resp.usageMetadata?.cachedContentTokenCount ?? 0),
-          latencyMs: Date.now() - start,
-          modelUsed: modelId,
-        };
-      } catch (err) {
-        if ((err as Error)?.name === 'AbortError' || params.signal?.aborted) {
-          throw err;
-        }
-        const info = extractReadableError(err);
-        const cls = classifyProviderError(info.message, info.status);
-        lastInfo = { message: info.message, status: info.status, cls };
-        if (!cls.retryable) {
-          throw new ProviderExecutionError(info.message, { ...cls, httpStatus: info.status });
-        }
-        await sleep(350 * (attempt + 1), params.signal);
+        if (cIdx < candidates.length - 1) continue;
+        throw timed;
+      }
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message, info.status);
+      lastInfo = { message: info.message, status: info.status, cls };
+      if (!cls.retryable && cIdx === candidates.length - 1) {
+        throw new ProviderExecutionError(info.message, { ...cls, httpStatus: info.status });
       }
     }
   }
 
   const finalErr = lastInfo ?? {
-    message: 'Upstream model call failed after retries.',
+    message: 'Upstream model call failed.',
     cls: classifyProviderError('Upstream unavailable', 503),
   };
   throw new ProviderExecutionError(finalErr.message, { ...finalErr.cls, httpStatus: finalErr.status });
@@ -215,18 +271,32 @@ export async function streamModelResponse(params: {
   callbacks: StreamCallbacks;
 }): Promise<void> {
   const { model, messages, systemInstruction, signal, callbacks } = params;
-  const timeoutMs = params.timeoutMs ?? 45_000;
-  const maxAttempts = params.maxAttempts ?? 3;
+  const timeoutMs = Math.min(Math.max(params.timeoutMs ?? 25_000, 1_000), 60_000);
+  const maxAttempts = Math.min(Math.max(params.maxAttempts ?? 1, 1), 2);
   const creds = getModelCredentials(model.id);
+
+  // Pre-routing capability validation: never dispatch image payloads to text-only models
+  const hasImages = messages.some((m) => Array.isArray(m.attachments) && m.attachments.length > 0);
+  if (hasImages && !model.inputModalities.includes('image')) {
+    throw new ProviderExecutionError(
+      `${model.displayName} does not support image attachments.`,
+      {
+        errorClass: 'validation_error',
+        healthStatus: model.availability,
+        retryable: false,
+        httpStatus: 400,
+      }
+    );
+  }
 
   if (model.provider === 'gemini') {
     const ai = createGeminiClient(creds.apiKey);
     if (!ai) {
       throw new ProviderExecutionError(
-        'Gemini API key is not configured on the server. Add GEMINI_API_KEY in Secrets or configure a provider key in Model Hub.',
+        `${model.displayName} is awaiting configuration: GEMINI_API_KEY is not configured on the server.`,
         {
           errorClass: 'configuration_error',
-          healthStatus: 'configuration_error',
+          healthStatus: 'awaiting_config',
           retryable: false,
         }
       );
@@ -267,7 +337,7 @@ export async function streamModelResponse(params: {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) return;
       let emittedChunk = false;
-      const attemptSignal = createAttemptSignal(signal, timeoutMs);
+      const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
       try {
         const stream = await ai.models.generateContentStream({
           model: model.upstreamModelId,
@@ -298,10 +368,24 @@ export async function streamModelResponse(params: {
       } catch (err) {
         lastErr = err;
         if (signal?.aborted) return;
+        const timeoutErr = normalizeTimeoutOrAbortError({
+          err,
+          model,
+          timeoutMs,
+          userSignal: signal,
+          timeoutSignal,
+        });
+        if (timeoutErr) {
+          if (!emittedChunk && attempt < maxAttempts - 1) {
+            await sleep(400, signal);
+            continue;
+          }
+          throw timeoutErr;
+        }
         const info = extractReadableError(err);
         const cls = classifyProviderError(info.message, info.status);
         if (!emittedChunk && info.retryable && attempt < maxAttempts - 1) {
-          await sleep(600 * Math.pow(2, attempt), signal);
+          await sleep(400, signal);
           continue;
         }
         throw new ProviderExecutionError(
@@ -332,10 +416,12 @@ export async function streamModelResponse(params: {
 
     if (!baseUrl || (!apiKey && model.provider === 'openai-compatible')) {
       throw new ProviderExecutionError(
-        `${model.displayName} requires ${model.provider === 'hosted-oss' ? 'HOSTED_OSS_BASE_URL' : 'OPENAI_API_KEY'} to be configured.`,
+        `${model.displayName} is awaiting configuration: requires ${
+          model.provider === 'hosted-oss' ? 'HOSTED_OSS_BASE_URL' : 'OPENAI_API_KEY'
+        }.`,
         {
           errorClass: 'configuration_error',
-          healthStatus: 'configuration_error',
+          healthStatus: 'awaiting_config',
           retryable: false,
         }
       );
@@ -349,94 +435,43 @@ export async function streamModelResponse(params: {
       formattedMessages.push({ role: m.role, content: m.content });
     }
 
-    const resp = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model: model.upstreamModelId,
-        messages: formattedMessages,
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
-      signal,
-    });
-
-    if (!resp.ok || !resp.body) {
-      const errText = await resp.text().catch(() => resp.statusText);
-      const cls = classifyProviderError(errText, resp.status);
-      throw new ProviderExecutionError(`Provider error (${resp.status}): ${errText}`, { ...cls, httpStatus: resp.status });
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(dataStr);
-          const delta = parsed.choices?.[0]?.delta?.content;
-          if (typeof delta === 'string' && delta.length > 0) {
-            callbacks.onChunk(delta);
-          }
-          if (parsed.usage) {
-            callbacks.onUsage?.({
-              inputTokens: parsed.usage.prompt_tokens,
-              outputTokens: parsed.usage.completion_tokens,
-              cachedTokens: parsed.usage.prompt_tokens_details?.cached_tokens ?? 0,
-            });
-          }
-        } catch {
-          // Ignore incomplete JSON frames
-        }
-      }
-    }
-    return;
-  }
-
-  if (model.provider === 'anthropic-compatible') {
-    const apiKey = creds.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    const baseUrl = creds.baseUrl ?? 'https://api.anthropic.com';
-    if (!apiKey) {
-      throw new ProviderExecutionError(`${model.displayName} requires ANTHROPIC_API_KEY to be configured.`, {
-        errorClass: 'configuration_error',
-        healthStatus: 'configuration_error',
-        retryable: false,
+    const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
+    let resp: Response;
+    try {
+      resp = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model: model.upstreamModelId,
+          messages: formattedMessages,
+          stream: true,
+          stream_options: { include_usage: true },
+        }),
+        signal: attemptSignal,
       });
+    } catch (err) {
+      if (signal?.aborted) return;
+      const timeoutErr = normalizeTimeoutOrAbortError({
+        err,
+        model,
+        timeoutMs,
+        userSignal: signal,
+        timeoutSignal,
+      });
+      if (timeoutErr) throw timeoutErr;
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message);
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
     }
-
-    const resp = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: model.upstreamModelId,
-        max_tokens: 4096,
-        system: systemInstruction?.trim() || undefined,
-        stream: true,
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
-      }),
-      signal,
-    });
 
     if (!resp.ok || !resp.body) {
       const errText = await resp.text().catch(() => resp.statusText);
-      const cls = classifyProviderError(errText, resp.status);
-      throw new ProviderExecutionError(`Anthropic-compatible provider error (${resp.status}): ${errText}`, {
+      const info = extractReadableError(errText);
+      const cls = classifyProviderError(info.message || errText, resp.status);
+      throw new ProviderExecutionError(`${model.displayName} upstream error (${resp.status}): ${info.message || errText}`, {
         ...cls,
         httpStatus: resp.status,
       });
@@ -445,35 +480,197 @@ export async function streamModelResponse(params: {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+
+    const processOpenAiLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const dataStr = trimmed.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') return;
+      let parsed: Record<string, any>;
+      try {
+        parsed = JSON.parse(dataStr) as Record<string, any>;
+      } catch {
+        return;
+      }
+      if (parsed.error) {
+        const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
+        const cls = classifyProviderError(msg);
+        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls });
+      }
+      const delta = parsed.choices?.[0]?.delta?.content;
+      if (typeof delta === 'string' && delta.length > 0) {
+        callbacks.onChunk(delta);
+      }
+      if (parsed.usage) {
+        callbacks.onUsage?.({
+          inputTokens: parsed.usage.prompt_tokens,
+          outputTokens: parsed.usage.completion_tokens,
+          cachedTokens: parsed.usage.prompt_tokens_details?.cached_tokens ?? 0,
+        });
+      }
+    };
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          processOpenAiLine(line);
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          processOpenAiLine(line);
+        }
+      }
+    } catch (err) {
+      if (signal?.aborted) return;
+      if (err instanceof ProviderExecutionError) throw err;
+      const timeoutErr = normalizeTimeoutOrAbortError({
+        err,
+        model,
+        timeoutMs,
+        userSignal: signal,
+        timeoutSignal,
+      });
+      if (timeoutErr) throw timeoutErr;
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message);
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
+    }
+    return;
+  }
+
+  if (model.provider === 'anthropic-compatible') {
+    const apiKey = creds.apiKey ?? process.env.ANTHROPIC_API_KEY;
+    const baseUrl = creds.baseUrl ?? 'https://api.anthropic.com';
+    if (!apiKey) {
+      throw new ProviderExecutionError(
+        `${model.displayName} is awaiting configuration: requires ANTHROPIC_API_KEY.`,
+        {
+          errorClass: 'configuration_error',
+          healthStatus: 'awaiting_config',
+          retryable: false,
+        }
+      );
+    }
+
+    const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
+    let resp: Response;
+    try {
+      resp = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: model.upstreamModelId,
+          max_tokens: 4096,
+          system: systemInstruction?.trim() || undefined,
+          stream: true,
+          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        }),
+        signal: attemptSignal,
+      });
+    } catch (err) {
+      if (signal?.aborted) return;
+      const timeoutErr = normalizeTimeoutOrAbortError({
+        err,
+        model,
+        timeoutMs,
+        userSignal: signal,
+        timeoutSignal,
+      });
+      if (timeoutErr) throw timeoutErr;
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message);
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
+    }
+
+    if (!resp.ok || !resp.body) {
+      const errText = await resp.text().catch(() => resp.statusText);
+      const info = extractReadableError(errText);
+      const cls = classifyProviderError(info.message || errText, resp.status);
+      throw new ProviderExecutionError(
+        `${model.displayName} upstream error (${resp.status}): ${info.message || errText}`,
+        {
+          ...cls,
+          httpStatus: resp.status,
+        }
+      );
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
     let inputTokens = 0;
     let outputTokens = 0;
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const dataStr = trimmed.slice(5).trim();
-        try {
-          const parsed = JSON.parse(dataStr);
-          if (parsed.type === 'message_start' && parsed.message?.usage?.input_tokens) {
-            inputTokens = parsed.message.usage.input_tokens;
-          }
-          if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
-            callbacks.onChunk(parsed.delta.text);
-          }
-          if (parsed.type === 'message_delta' && parsed.usage?.output_tokens) {
-            outputTokens = parsed.usage.output_tokens;
-            callbacks.onUsage?.({ inputTokens, outputTokens, cachedTokens: 0 });
-          }
-        } catch {
-          // Ignore incomplete frames
+    const processAnthropicLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const dataStr = trimmed.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') return;
+      let parsed: Record<string, any>;
+      try {
+        parsed = JSON.parse(dataStr) as Record<string, any>;
+      } catch {
+        return;
+      }
+      if (parsed.type === 'error' && parsed.error) {
+        const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
+        const cls = classifyProviderError(msg);
+        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls });
+      }
+      if (parsed.type === 'message_start' && parsed.message?.usage?.input_tokens) {
+        inputTokens = parsed.message.usage.input_tokens;
+      }
+      if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+        callbacks.onChunk(parsed.delta.text);
+      }
+      if (parsed.type === 'message_delta' && parsed.usage?.output_tokens) {
+        outputTokens = parsed.usage.output_tokens;
+        callbacks.onUsage?.({ inputTokens, outputTokens, cachedTokens: 0 });
+      }
+    };
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          processAnthropicLine(line);
         }
       }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          processAnthropicLine(line);
+        }
+      }
+    } catch (err) {
+      if (signal?.aborted) return;
+      if (err instanceof ProviderExecutionError) throw err;
+      const timeoutErr = normalizeTimeoutOrAbortError({
+        err,
+        model,
+        timeoutMs,
+        userSignal: signal,
+        timeoutSignal,
+      });
+      if (timeoutErr) throw timeoutErr;
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message);
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
     }
     return;
   }
@@ -497,7 +694,7 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
     let sampleText = '';
     await streamModelResponse({
       model,
-      timeoutMs: 12_000,
+      timeoutMs: 10_000,
       maxAttempts: 1,
       messages: [{ role: 'user', content: 'Respond with exactly: OK' }],
       callbacks: {
@@ -509,8 +706,8 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
     const latencyMs = Date.now() - start;
     const ok = sampleText.trim().length > 0;
     const healthStatus: AvailabilityStatus = !ok
-      ? 'error'
-      : latencyMs > 8500
+      ? 'temporarily_unavailable'
+      : latencyMs > 6000
       ? 'slow'
       : 'operational';
 
@@ -521,19 +718,20 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
       errorClass: ok ? null : 'provider_unavailable',
       message: ok
         ? `Verified live response from ${model.provider}/${model.upstreamModelId} (${latencyMs}ms)`
-        : 'Empty response from provider',
+        : `${model.displayName} returned an empty probe response.`,
     };
   } catch (err) {
     const latencyMs = Date.now() - start;
     if (err instanceof ProviderExecutionError) {
-      const normalizedStatus: AvailabilityStatus =
-        err.errorClass === 'configuration_error' && model.provider !== 'gemini'
-          ? 'awaiting_config'
+      // Never classify a failed probe as 'slow', 'connected', or 'operational'.
+      const failedStatus: AvailabilityStatus =
+        err.healthStatus === 'slow' || err.healthStatus === 'operational' || err.healthStatus === 'connected'
+          ? 'temporarily_unavailable'
           : err.healthStatus;
       return {
         ok: false,
         latencyMs,
-        healthStatus: normalizedStatus,
+        healthStatus: failedStatus,
         errorClass: err.errorClass,
         message: err.message,
       };
@@ -543,7 +741,10 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
     return {
       ok: false,
       latencyMs,
-      healthStatus: cls.healthStatus,
+      healthStatus:
+        cls.healthStatus === 'slow' || cls.healthStatus === 'operational' || cls.healthStatus === 'connected'
+          ? 'temporarily_unavailable'
+          : cls.healthStatus,
       errorClass: cls.errorClass,
       message: msg,
     };

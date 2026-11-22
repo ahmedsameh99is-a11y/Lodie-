@@ -96,6 +96,7 @@ export interface BrandedModel {
   thinkingPreset?: 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'XHIGH';
   errorClass?: ErrorClass | null;
   avgLatencyMs?: number | null;
+  lastErrorDetail?: string | null;
 }
 
 export interface ProjectFileRecord {

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { db, mapRowToBrandedModel, recordAuditLog } from '../db';
+import { sortBrandedModels } from '../../src/shared/modelRegistry';
+import { db, evaluateProviderCredentials, mapRowToBrandedModel, recordAuditLog } from '../db';
 import { type AuthenticatedRequest, requireAuth, requireDeveloper } from '../middleware';
 import { testProviderConnection } from '../providers';
 import { createRateLimiter, encryptSecret, validateExternalHttpUrl } from '../security';
@@ -15,45 +16,56 @@ const healthCheckLimiter = createRateLimiter({
 
 modelsRouter.get('/', (_req, res) => {
   const rows = db.prepare('SELECT * FROM model_registry').all() as Array<Record<string, unknown>>;
-  const order = ['sonic-3', 'sonic-3.5', 'lodie-5.5', 'fables-5.3', 'loody-vision-1'];
-  const models = rows
-    .map(mapRowToBrandedModel)
-    .sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+  const models = sortBrandedModels(rows.map(mapRowToBrandedModel));
   res.json({ models });
 });
 
 modelsRouter.post('/health-check', requireAuth, healthCheckLimiter, async (req: AuthenticatedRequest, res) => {
   const rows = db.prepare('SELECT * FROM model_registry').all() as Array<Record<string, unknown>>;
+  const models = sortBrandedModels(rows.map(mapRowToBrandedModel));
   const now = new Date().toISOString();
-  const results: Array<{
-    id: string;
-    displayName: string;
-    ok: boolean;
-    healthStatus: string;
-    errorClass: string | null;
-    latencyMs: number;
-    message: string;
-  }> = [];
 
-  for (const row of rows) {
-    const model = mapRowToBrandedModel(row);
-    const check = await testProviderConnection(model);
-    db.prepare(`
-      UPDATE model_registry
-      SET availability = ?, availability_reason = ?, last_tested_at = ?, error_class = ?, avg_latency_ms = ?
-      WHERE id = ?
-    `).run(check.healthStatus, check.message, now, check.errorClass, check.latencyMs, model.id);
+  const updateModelStmt = db.prepare(`
+    UPDATE model_registry
+    SET availability = ?, availability_reason = ?, last_tested_at = ?, error_class = ?, avg_latency_ms = ?, last_error_detail = ?
+    WHERE id = ?
+  `);
 
-    results.push({
-      id: model.id,
-      displayName: model.displayName,
-      ok: check.ok,
-      healthStatus: check.healthStatus,
-      errorClass: check.errorClass,
-      latencyMs: check.latencyMs,
-      message: check.message,
-    });
-  }
+  const results = await Promise.all(
+    models.map(async (model) => {
+      if (model.availability === 'disabled') {
+        return {
+          id: model.id,
+          displayName: model.displayName,
+          ok: false,
+          healthStatus: 'disabled',
+          errorClass: null,
+          latencyMs: 0,
+          message: model.availabilityReason || 'Disabled by administrator',
+        };
+      }
+      const check = await testProviderConnection(model);
+      updateModelStmt.run(
+        check.healthStatus,
+        check.message,
+        now,
+        check.errorClass,
+        check.latencyMs,
+        check.ok ? null : check.message,
+        model.id
+      );
+
+      return {
+        id: model.id,
+        displayName: model.displayName,
+        ok: check.ok,
+        healthStatus: check.healthStatus,
+        errorClass: check.errorClass,
+        latencyMs: check.latencyMs,
+        message: check.message,
+      };
+    })
+  );
 
   recordAuditLog({
     actorUserId: req.authUser!.id,
@@ -61,11 +73,12 @@ modelsRouter.post('/health-check', requireAuth, healthCheckLimiter, async (req: 
     action: 'models_health_check',
     targetType: 'model_registry',
     outcome: 'success',
-    detail: `Checked ${results.length} models`,
+    detail: `Checked ${results.length} models (${results.filter((r) => r.ok).length} operational)`,
   });
 
-  const refreshed = (db.prepare('SELECT * FROM model_registry').all() as Array<Record<string, unknown>>)
-    .map(mapRowToBrandedModel);
+  const refreshed = sortBrandedModels(
+    (db.prepare('SELECT * FROM model_registry').all() as Array<Record<string, unknown>>).map(mapRowToBrandedModel)
+  );
   res.json({ checkedAt: now, results, models: refreshed });
 });
 
@@ -118,8 +131,6 @@ modelsRouter.patch('/admin/:id', requireDeveloper, (req: AuthenticatedRequest, r
   const nextProvider = parsed.data.provider ?? String(existing.provider);
   const nextUpstream = parsed.data.upstreamModelId ?? String(existing.upstream_model_id);
   const nextPlan = parsed.data.requiredPlan ?? String(existing.required_plan);
-  const nextAvail = parsed.data.availability ?? String(existing.availability);
-  const nextReason = parsed.data.availabilityReason ?? String(existing.availability_reason);
   const nextThinking = parsed.data.thinkingPreset ?? (existing.thinking_preset ? String(existing.thinking_preset) : null);
   const nextBaseUrl =
     parsed.data.customBaseUrl !== undefined ? parsed.data.customBaseUrl : (existing.custom_base_url ? String(existing.custom_base_url) : null);
@@ -129,10 +140,40 @@ modelsRouter.patch('/admin/:id', requireDeveloper, (req: AuthenticatedRequest, r
     nextEncryptedKey = parsed.data.customApiKey ? encryptSecret(parsed.data.customApiKey) : null;
   }
 
+  const routingChanged =
+    parsed.data.provider !== undefined ||
+    parsed.data.upstreamModelId !== undefined ||
+    parsed.data.customBaseUrl !== undefined ||
+    parsed.data.customApiKey !== undefined;
+
+  const credState = evaluateProviderCredentials({
+    provider: nextProvider,
+    hasEncryptedKey: Boolean(nextEncryptedKey),
+    customBaseUrl: nextBaseUrl,
+  });
+
+  let nextAvail = parsed.data.availability ?? String(existing.availability);
+  let nextReason = parsed.data.availabilityReason ?? String(existing.availability_reason);
+  let nextLastTested = existing.last_tested_at ? String(existing.last_tested_at) : null;
+  let nextErrorClass = existing.error_class ? String(existing.error_class) : null;
+  let nextAvgLatency = existing.avg_latency_ms !== null && existing.avg_latency_ms !== undefined ? Number(existing.avg_latency_ms) : null;
+  let nextErrorDetail = existing.last_error_detail ? String(existing.last_error_detail) : null;
+
+  if (routingChanged && parsed.data.availability === undefined) {
+    // Re-evaluate credential status cleanly without carrying stale operational proof from an old mapping
+    nextAvail = credState.configured ? 'connected' : 'awaiting_config';
+    nextReason = parsed.data.availabilityReason ?? (credState.configured ? credState.configuredReason : credState.missingReason);
+    nextLastTested = null;
+    nextErrorClass = credState.configured ? null : 'configuration_error';
+    nextAvgLatency = null;
+    nextErrorDetail = null;
+  }
+
   db.prepare(`
     UPDATE model_registry
     SET provider = ?, upstream_model_id = ?, required_plan = ?, availability = ?,
-        availability_reason = ?, thinking_preset = ?, custom_base_url = ?, encrypted_api_key = ?
+        availability_reason = ?, thinking_preset = ?, custom_base_url = ?, encrypted_api_key = ?,
+        last_tested_at = ?, error_class = ?, avg_latency_ms = ?, last_error_detail = ?
     WHERE id = ?
   `).run(
     nextProvider,
@@ -143,6 +184,10 @@ modelsRouter.patch('/admin/:id', requireDeveloper, (req: AuthenticatedRequest, r
     nextThinking,
     nextBaseUrl,
     nextEncryptedKey,
+    nextLastTested,
+    nextErrorClass,
+    nextAvgLatency,
+    nextErrorDetail,
     req.params.id
   );
 
@@ -174,7 +219,7 @@ modelsRouter.post('/admin/:id/test', requireDeveloper, async (req: Authenticated
 
   db.prepare(`
     UPDATE model_registry
-    SET availability = ?, availability_reason = ?, last_tested_at = ?, error_class = ?, avg_latency_ms = ?
+    SET availability = ?, availability_reason = ?, last_tested_at = ?, error_class = ?, avg_latency_ms = ?, last_error_detail = ?
     WHERE id = ?
   `).run(
     result.healthStatus,
@@ -182,6 +227,7 @@ modelsRouter.post('/admin/:id/test', requireDeveloper, async (req: Authenticated
     now,
     result.errorClass,
     result.latencyMs,
+    result.ok ? null : result.message,
     model.id
   );
 

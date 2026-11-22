@@ -238,6 +238,7 @@ export async function runBuiltinToolById(params: ToolRunParams): Promise<ToolRun
           contents: `Search the web and summarize verifiable facts for: ${query}`,
           config: {
             tools: [{ googleSearch: {} }],
+            abortSignal: AbortSignal.timeout(15_000),
           },
         });
         const chunks = resp.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];

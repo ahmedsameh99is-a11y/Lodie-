@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { validateModelCompatibility } from '../../src/shared/modelRegistry';
+import { selectFallbackCandidate, validateModelCompatibility } from '../../src/shared/modelRegistry';
 import {
   canAccessModel,
   checkQuotaAllowance,
@@ -426,15 +426,44 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
     return;
   }
 
-  const compat = validateModelCompatibility({
-    model,
-    hasImageAttachments: Boolean(attachments && attachments.length > 0),
-    requiresStreaming: true,
-  });
-  if (!compat.compatible) {
-    res.status(400).json({ error: compat.reason, code: 'MODEL_INCOMPATIBLE' });
+  const hasImageAttachments = Boolean(attachments && attachments.length > 0);
+  if (hasImageAttachments && !model.inputModalities.includes('image')) {
+    res.status(400).json({
+      error: `${model.displayName} does not support image attachments. Switch to LOODY Vision 1 or another multimodal model.`,
+      code: 'MODEL_INCOMPATIBLE',
+    });
     return;
   }
+  if (!model.supportsStreaming) {
+    res.status(400).json({
+      error: `${model.displayName} does not support streaming responses.`,
+      code: 'MODEL_INCOMPATIBLE',
+    });
+    return;
+  }
+
+  const configBlockedStates = new Set([
+    'awaiting_config',
+    'configuration_error',
+    'authentication_error',
+    'disabled',
+  ]);
+  if (configBlockedStates.has(model.availability)) {
+    const compat = validateModelCompatibility({
+      model,
+      hasImageAttachments,
+      requiresStreaming: true,
+    });
+    res.status(model.availability === 'disabled' ? 403 : 400).json({
+      error: compat.reason ?? `${model.displayName} is awaiting configuration.`,
+      code: 'MODEL_UNAVAILABLE',
+    });
+    return;
+  }
+
+  // If the model failed a previous runtime probe ('temporarily_unavailable' / 'error'), allow a bounded live check once OR clean error if uncallable.
+  const isTransientlyDegraded =
+    model.availability === 'temporarily_unavailable' || model.availability === 'error';
 
   const usage = getUserQuotaUsage(user.id);
   const docTokens = (documentAttachments ?? []).reduce((sum, d) => sum + estimateTextTokens(d.extractedText), 0);
@@ -681,7 +710,7 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
   });
 
   const sendEvent = (event: string, data: unknown) => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !res.destroyed) {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     }
   };
@@ -699,16 +728,139 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
   let assistantContent = '';
   let reportedUsage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } | undefined;
   let fallbackReason: string | undefined;
+  let persistedReply: {
+    messageId: string;
+    reconciled: ReturnType<typeof reconcileTokenRecord>;
+    costUsd: number;
+    quota: ReturnType<typeof getUserQuotaUsage>;
+  } | null = null;
+
+  const persistAssistantReply = () => {
+    if (persistedReply) return persistedReply;
+    if (assistantContent.trim().length === 0) return null;
+
+    const reconciled = reconcileTokenRecord({
+      providerReported: reportedUsage,
+      fallbackInputText: historyRows.map((h) => h.content).join('\n'),
+      fallbackOutputText: assistantContent,
+    });
+    const costUsd = computeEstimatedCostUsd({
+      provider: activeRunModel.provider,
+      inputTokens: reconciled.inputTokens,
+      outputTokens: reconciled.outputTokens,
+      cachedTokens: reconciled.cachedTokens,
+    });
+
+    const assistantMsgId = crypto.randomUUID();
+    const finishedAt = new Date().toISOString();
+    const taskType = attachments && attachments.length > 0 ? 'vision' : 'chat';
+    db.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, user_id, role, content, citations_json, model_id, provider,
+        input_tokens, output_tokens, cached_tokens, token_accounting_type, created_at
+      ) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      assistantMsgId,
+      conversationId,
+      user.id,
+      assistantContent,
+      citations.length > 0 ? JSON.stringify(citations) : null,
+      activeRunModel.id,
+      activeRunModel.provider,
+      reconciled.inputTokens,
+      reconciled.outputTokens,
+      reconciled.cachedTokens,
+      reconciled.accountingType,
+      finishedAt
+    );
+
+    db.prepare('UPDATE conversations SET model_id = ?, updated_at = ? WHERE id = ? AND user_id = ?').run(
+      activeRunModel.id,
+      finishedAt,
+      conversationId,
+      user.id
+    );
+
+    db.prepare(`
+      INSERT INTO token_usage (
+        id, user_id, conversation_id, model_id, provider, task_type, input_tokens, output_tokens,
+        cached_tokens, accounting_type, estimated_cost_usd, usage_date, usage_month, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      crypto.randomUUID(),
+      user.id,
+      conversationId,
+      activeRunModel.id,
+      activeRunModel.provider,
+      taskType,
+      reconciled.inputTokens,
+      reconciled.outputTokens,
+      reconciled.cachedTokens,
+      reconciled.accountingType,
+      costUsd,
+      finishedAt.slice(0, 10),
+      finishedAt.slice(0, 7),
+      finishedAt
+    );
+
+    persistedReply = {
+      messageId: assistantMsgId,
+      reconciled,
+      costUsd,
+      quota: getUserQuotaUsage(user.id),
+    };
+    return persistedReply;
+  };
+
+  const recordRuntimeModelStatus = (params: {
+    targetModelId: string;
+    ok: boolean;
+    latencyMs: number;
+    err?: unknown;
+  }) => {
+    const testedAt = new Date().toISOString();
+    if (params.ok) {
+      const nextStatus = params.latencyMs > 6000 ? 'slow' : 'operational';
+      db.prepare(`
+        UPDATE model_registry
+        SET availability = ?, availability_reason = ?, last_tested_at = ?, error_class = NULL, avg_latency_ms = ?, last_error_detail = NULL
+        WHERE id = ?
+      `).run(
+        nextStatus,
+        `Verified live streaming response (${params.latencyMs}ms)`,
+        testedAt,
+        params.latencyMs,
+        params.targetModelId
+      );
+      return;
+    }
+    const execErr = params.err instanceof ProviderExecutionError ? params.err : null;
+    const rawMsg = params.err instanceof Error ? params.err.message : 'Upstream provider failure';
+    const nextHealth =
+      execErr &&
+      execErr.healthStatus !== 'slow' &&
+      execErr.healthStatus !== 'operational' &&
+      execErr.healthStatus !== 'connected'
+        ? execErr.healthStatus
+        : 'temporarily_unavailable';
+    const nextErrClass = execErr?.errorClass ?? 'provider_unavailable';
+    db.prepare(`
+      UPDATE model_registry
+      SET availability = ?, availability_reason = ?, last_tested_at = ?, error_class = ?, avg_latency_ms = ?, last_error_detail = ?
+      WHERE id = ?
+    `).run(nextHealth, rawMsg.slice(0, 240), testedAt, nextErrClass, params.latencyMs, rawMsg.slice(0, 480), params.targetModelId);
+  };
 
   try {
+    const primaryStart = Date.now();
     try {
       await streamModelResponse({
         model: activeRunModel,
         messages: providerMessages,
         systemInstruction,
         signal: abortController.signal,
-        timeoutMs: allowFallback ? 35_000 : 60_000,
-        maxAttempts: allowFallback ? 1 : 3,
+        timeoutMs: isTransientlyDegraded ? 12_000 : allowFallback ? 20_000 : 25_000,
+        maxAttempts: 1,
         callbacks: {
           onChunk: (text) => {
             assistantContent += text;
@@ -719,30 +871,40 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
           },
         },
       });
+      if (!abortController.signal.aborted && assistantContent.trim().length > 0) {
+        recordRuntimeModelStatus({
+          targetModelId: activeRunModel.id,
+          ok: true,
+          latencyMs: Date.now() - primaryStart,
+        });
+      }
     } catch (primaryErr) {
+      if (!abortController.signal.aborted) {
+        recordRuntimeModelStatus({
+          targetModelId: activeRunModel.id,
+          ok: false,
+          latencyMs: Date.now() - primaryStart,
+          err: primaryErr,
+        });
+      }
       const errDetail = primaryErr instanceof Error ? primaryErr.message : 'Primary provider error';
       const errClass = primaryErr instanceof ProviderExecutionError ? primaryErr.errorClass : 'provider_unavailable';
       if (allowFallback && assistantContent.length === 0 && !abortController.signal.aborted) {
-        const fallbackCandidates = (
-          db
-            .prepare("SELECT * FROM model_registry WHERE availability IN ('operational', 'connected', 'slow') AND id != ?")
-            .all(model.id) as Array<Record<string, unknown>>
-        )
-          .map(mapRowToBrandedModel)
-          .filter(
-            (cand) =>
-              canAccessModel({ role: user.role, plan: user.plan }, cand).allowed &&
-              validateModelCompatibility({
-                model: cand,
-                hasImageAttachments: Boolean(attachments && attachments.length > 0),
-                requiresStreaming: true,
-              }).compatible
-          );
-        const fallbackModel = fallbackCandidates[0];
+        const allRegistryModels = (
+          db.prepare('SELECT * FROM model_registry').all() as Array<Record<string, unknown>>
+        ).map(mapRowToBrandedModel);
+
+        const fallbackModel = selectFallbackCandidate({
+          failedModel: model,
+          allModels: allRegistryModels,
+          user: { role: user.role, plan: user.plan },
+          hasImageAttachments,
+          requiresStreaming: true,
+        });
         if (!fallbackModel) throw primaryErr;
 
         activeRunModel = fallbackModel;
-        fallbackReason = `${errClass}: ${errDetail}`;
+        fallbackReason = errDetail;
         sendEvent('meta', {
           conversationId,
           userMessageId,
@@ -753,112 +915,101 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
           fallbackReason,
           fallbackErrorClass: errClass,
         });
-        await streamModelResponse({
-          model: fallbackModel,
-          messages: providerMessages,
-          systemInstruction,
-          signal: abortController.signal,
-          callbacks: {
-            onChunk: (text) => {
-              assistantContent += text;
-              sendEvent('chunk', { text });
+        const fbStart = Date.now();
+        try {
+          await streamModelResponse({
+            model: fallbackModel,
+            messages: providerMessages,
+            systemInstruction,
+            signal: abortController.signal,
+            timeoutMs: 22_000,
+            maxAttempts: 1,
+            callbacks: {
+              onChunk: (text) => {
+                assistantContent += text;
+                sendEvent('chunk', { text });
+              },
+              onUsage: (u) => {
+                reportedUsage = u;
+              },
             },
-            onUsage: (u) => {
-              reportedUsage = u;
-            },
-          },
-        });
+          });
+          if (!abortController.signal.aborted && assistantContent.trim().length > 0) {
+            recordRuntimeModelStatus({
+              targetModelId: fallbackModel.id,
+              ok: true,
+              latencyMs: Date.now() - fbStart,
+            });
+          }
+        } catch (fbErr) {
+          if (!abortController.signal.aborted) {
+            recordRuntimeModelStatus({
+              targetModelId: fallbackModel.id,
+              ok: false,
+              latencyMs: Date.now() - fbStart,
+              err: fbErr,
+            });
+          }
+          throw fbErr;
+        }
       } else {
         throw primaryErr;
       }
     }
 
-    if (assistantContent.trim().length > 0) {
-      const reconciled = reconcileTokenRecord({
-        providerReported: reportedUsage,
-        fallbackInputText: historyRows.map((h) => h.content).join('\n'),
-        fallbackOutputText: assistantContent,
-      });
-      const costUsd = computeEstimatedCostUsd({
-        provider: activeRunModel.provider,
-        inputTokens: reconciled.inputTokens,
-        outputTokens: reconciled.outputTokens,
-        cachedTokens: reconciled.cachedTokens,
-      });
-
-      const assistantMsgId = crypto.randomUUID();
-      const finishedAt = new Date().toISOString();
-      const taskType = attachments && attachments.length > 0 ? 'vision' : 'chat';
-      db.prepare(`
-        INSERT INTO messages (
-          id, conversation_id, user_id, role, content, citations_json, model_id, provider,
-          input_tokens, output_tokens, cached_tokens, token_accounting_type, created_at
-        ) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        assistantMsgId,
-        conversationId,
-        user.id,
-        assistantContent,
-        citations.length > 0 ? JSON.stringify(citations) : null,
-        activeRunModel.id,
-        activeRunModel.provider,
-        reconciled.inputTokens,
-        reconciled.outputTokens,
-        reconciled.cachedTokens,
-        reconciled.accountingType,
-        finishedAt
-      );
-
-      db.prepare('UPDATE conversations SET model_id = ?, updated_at = ? WHERE id = ? AND user_id = ?').run(
-        activeRunModel.id,
-        finishedAt,
-        conversationId,
-        user.id
-      );
-
-      db.prepare(`
-        INSERT INTO token_usage (
-          id, user_id, conversation_id, model_id, provider, task_type, input_tokens, output_tokens,
-          cached_tokens, accounting_type, estimated_cost_usd, usage_date, usage_month, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        crypto.randomUUID(),
-        user.id,
-        conversationId,
-        activeRunModel.id,
-        activeRunModel.provider,
-        taskType,
-        reconciled.inputTokens,
-        reconciled.outputTokens,
-        reconciled.cachedTokens,
-        reconciled.accountingType,
-        costUsd,
-        finishedAt.slice(0, 10),
-        finishedAt.slice(0, 7),
-        finishedAt
-      );
-
+    const saved = persistAssistantReply();
+    if (saved) {
       sendEvent('done', {
-        messageId: assistantMsgId,
+        messageId: saved.messageId,
         conversationId,
         modelId: activeRunModel.id,
         fallbackUsed: activeRunModel.id !== model.id ? model.id : undefined,
+        aborted: abortController.signal.aborted || undefined,
         citations,
         usage: {
-          ...reconciled,
-          estimatedCostUsd: costUsd,
+          ...saved.reconciled,
+          estimatedCostUsd: saved.costUsd,
         },
-        quota: getUserQuotaUsage(user.id),
+        quota: saved.quota,
       });
     } else if (abortController.signal.aborted) {
       sendEvent('done', { conversationId, aborted: true });
     } else {
-      sendEvent('error', { error: `${activeRunModel.displayName} returned an empty response. Please retry or switch models.` });
+      sendEvent('error', {
+        error: `${activeRunModel.displayName} returned an empty response. Please retry or switch models.`,
+        conversationId,
+        partialSaved: false,
+      });
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Model inference failed.';
-    sendEvent('error', { error: message });
+    let saved: ReturnType<typeof persistAssistantReply> = null;
+    try {
+      saved = persistAssistantReply();
+    } catch {
+      // Do not hide stream error if partial save fails
+    }
+
+    if (abortController.signal.aborted || (err as Error)?.name === 'AbortError') {
+      sendEvent('done', {
+        conversationId,
+        aborted: true,
+        messageId: saved?.messageId,
+        modelId: activeRunModel.id,
+        citations,
+        quota: saved?.quota,
+      });
+    } else {
+      const message = err instanceof Error ? err.message : 'Model inference failed.';
+      sendEvent('error', {
+        error: saved ? `${message} (Partial response saved.)` : message,
+        conversationId,
+        partialSaved: Boolean(saved),
+        messageId: saved?.messageId,
+      });
+    }
   } finally {
-    res.end();
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
 });

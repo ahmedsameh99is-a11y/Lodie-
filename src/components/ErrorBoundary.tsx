@@ -53,3 +53,54 @@ export class ErrorBoundary extends React.Component<
     return this.props.children;
   }
 }
+
+interface InlineBoundaryProps {
+  children: React.ReactNode;
+  fallbackText: string;
+  resetKey?: string;
+}
+
+interface InlineBoundaryState {
+  hasError: boolean;
+}
+
+export class InlineMarkdownErrorBoundary extends React.Component<
+  InlineBoundaryProps,
+  InlineBoundaryState
+> {
+  constructor(props: InlineBoundaryProps) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(): InlineBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidUpdate(prevProps: InlineBoundaryProps) {
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('LOODY InlineMarkdownErrorBoundary:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="space-y-1.5">
+          <p className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+            Rendered as plain text (formatting syntax could not be parsed cleanly).
+          </p>
+          <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
+            {this.props.fallbackText}
+          </pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+

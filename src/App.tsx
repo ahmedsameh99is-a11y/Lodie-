@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { api } from './lib/api';
 import { auth, syncUserProfileToFirestore } from './lib/firebase';
+import { parseSharedTranscriptSafely } from './shared/chatStream';
 import { t } from './shared/i18n';
 import type {
   AccentColor,
@@ -31,6 +32,7 @@ import { AppSidebar, type WorkspaceViewId } from './components/AppSidebar';
 import { AuthModal } from './components/AuthModal';
 import { ChatWorkspace } from './components/ChatWorkspace';
 import { CreativeStudioView } from './components/CreativeStudioView';
+import { InlineMarkdownErrorBoundary } from './components/ErrorBoundary';
 import { FilesView } from './components/FilesView';
 import { HelpView } from './components/HelpView';
 import { HomeView } from './components/HomeView';
@@ -263,9 +265,10 @@ export default function App() {
   };
 
   if (sharedSnapshot || shareError) {
-    const parsedTranscript = sharedSnapshot
-      ? (JSON.parse(sharedSnapshot.transcript) as Array<{ role: string; content: string }>)
-      : [];
+    const parsedShare = sharedSnapshot
+      ? parseSharedTranscriptSafely(sharedSnapshot.transcript)
+      : { ok: true, messages: [], error: null };
+    const effectiveShareError = shareError ?? parsedShare.error;
     return (
       <div className="min-h-dvh bg-[#F8FAF9] dark:bg-[#050706] text-zinc-900 dark:text-[#F1F5F3] px-4 py-8">
         <div className="mx-auto max-w-3xl space-y-6">
@@ -295,13 +298,13 @@ export default function App() {
             </button>
           </div>
 
-          {shareError ? (
+          {effectiveShareError ? (
             <div className="rounded-2xl border border-red-500/30 bg-red-50 dark:bg-red-950/30 p-5 text-sm text-red-700 dark:text-red-200">
-              {shareError}
+              {effectiveShareError}
             </div>
           ) : (
             <div className="space-y-4">
-              {parsedTranscript.map((m, idx) => (
+              {parsedShare.messages.map((m, idx) => (
                 <article
                   key={idx}
                   className="rounded-2xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] p-5"
@@ -310,7 +313,9 @@ export default function App() {
                     {m.role}
                   </div>
                   <div className="prose prose-zinc dark:prose-invert prose-sm max-w-none">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                    <InlineMarkdownErrorBoundary fallbackText={m.content} resetKey={m.content}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                    </InlineMarkdownErrorBoundary>
                   </div>
                 </article>
               ))}

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Check, Cpu, Lock, Settings2, Zap, Eye, Sparkles } from 'lucide-react';
 import { api } from '../lib/api';
+import { getModelStatusMeta } from '../shared/modelRegistry';
 import { canAccessModel } from '../shared/quotas';
 import type { BrandedModel, ProviderId, PublicUser } from '../shared/types';
 
@@ -98,7 +99,7 @@ export const ModelHub: React.FC<ModelHubProps> = ({
                 try {
                   const res = await api.checkModelsHealth();
                   const okCount = res.results.filter((r) => r.ok).length;
-                  setStatusMsg(`Health check finished: ${okCount}/${res.results.length} models operational.`);
+                  setStatusMsg(`Health check finished: ${okCount}/${res.results.length} models verified responding.`);
                   onModelsUpdated();
                 } catch (err) {
                   setStatusMsg(err instanceof Error ? err.message : 'Health check failed.');
@@ -137,19 +138,8 @@ export const ModelHub: React.FC<ModelHubProps> = ({
                   { role: user?.role ?? 'user', plan: user?.plan ?? 'free' },
                   m
                 );
-                const isOperational =
-                  m.availability === 'operational' || m.availability === 'connected' || m.availability === 'slow';
-                const statusLabel: Record<string, string> = {
-                  operational: 'Operational',
-                  connected: 'Connected',
-                  slow: 'Slow',
-                  temporarily_unavailable: 'Temporarily Unavailable',
-                  configuration_error: 'Config Error',
-                  authentication_error: 'Auth Error',
-                  awaiting_config: 'Awaiting Config',
-                  disabled: 'Disabled',
-                  error: 'Error',
-                };
+                const statusMeta = getModelStatusMeta(m);
+                const isCallable = statusMeta.callable;
 
                 return (
                   <div
@@ -182,18 +172,24 @@ export const ModelHub: React.FC<ModelHubProps> = ({
                       <div className="text-end">
                         <span
                           className={`text-xs font-medium whitespace-nowrap ${
-                            m.availability === 'operational' || m.availability === 'connected'
+                            m.availability === 'operational'
                               ? 'text-emerald-600 dark:text-emerald-400'
-                              : m.availability === 'slow' || m.availability === 'awaiting_config'
+                              : m.availability === 'connected' || m.availability === 'slow' || m.availability === 'awaiting_config'
                               ? 'text-amber-600 dark:text-amber-400'
                               : 'text-red-500'
                           }`}
                         >
-                          {statusLabel[m.availability] ?? m.availability}
+                          {statusMeta.badgeLabel}
                         </span>
-                        {typeof m.avgLatencyMs === 'number' && m.avgLatencyMs > 0 && (
-                          <div className="text-[10px] font-mono text-zinc-500">{m.avgLatencyMs}ms</div>
-                        )}
+                        <div className="text-[10px] font-mono text-zinc-500">
+                          {statusMeta.connectivityTested
+                            ? typeof m.avgLatencyMs === 'number' && m.avgLatencyMs > 0
+                              ? `Tested · ${m.avgLatencyMs}ms`
+                              : 'Tested'
+                            : statusMeta.configured
+                            ? 'Not tested'
+                            : 'No credentials'}
+                        </div>
                         {m.errorClass && (
                           <div className="text-[10px] font-mono text-red-500">{m.errorClass}</div>
                         )}
@@ -232,12 +228,12 @@ export const ModelHub: React.FC<ModelHubProps> = ({
                     <div className="mt-4 flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        disabled={!isOperational || !access.allowed}
+                        disabled={!isCallable || !access.allowed}
                         onClick={() => onSelectModel(m.id)}
                         className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold min-h-[40px] cursor-pointer ${
                           isSelected
                             ? 'bg-emerald-600 text-white'
-                            : !isOperational || !access.allowed
+                            : !isCallable || !access.allowed
                             ? 'bg-zinc-100 dark:bg-white/5 text-zinc-400 dark:text-zinc-500 cursor-not-allowed'
                             : 'border border-emerald-500/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10'
                         }`}
@@ -252,6 +248,8 @@ export const ModelHub: React.FC<ModelHubProps> = ({
                             <Check className="w-3.5 h-3.5" />
                             <span>Selected</span>
                           </>
+                        ) : !isCallable ? (
+                          <span>{statusMeta.badgeLabel}</span>
                         ) : (
                           <span>Use {m.displayName}</span>
                         )}

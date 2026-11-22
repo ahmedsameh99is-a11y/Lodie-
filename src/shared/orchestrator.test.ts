@@ -34,7 +34,7 @@ test('classifyProviderError distinguishes auth, rate limit, quota, latency, and 
 
   const rateErr = classifyProviderError('Rate limit exceeded', 429);
   assert.equal(rateErr.errorClass, 'rate_limit');
-  assert.equal(rateErr.healthStatus, 'slow');
+  assert.equal(rateErr.healthStatus, 'temporarily_unavailable');
   assert.equal(rateErr.retryable, true);
 
   const quotaErr = classifyProviderError('insufficient_quota billing cap reached');
@@ -44,10 +44,17 @@ test('classifyProviderError distinguishes auth, rate limit, quota, latency, and 
 
   const latencyErr = classifyProviderError('Request timed out after 15000ms', 504);
   assert.equal(latencyErr.errorClass, 'latency');
+  assert.equal(latencyErr.healthStatus, 'temporarily_unavailable');
   assert.equal(latencyErr.retryable, true);
+
+  const notFoundErr = classifyProviderError('Model does not exist', 404);
+  assert.equal(notFoundErr.errorClass, 'configuration_error');
+  assert.equal(notFoundErr.healthStatus, 'configuration_error');
+  assert.equal(notFoundErr.retryable, false);
 
   const unavailErr = classifyProviderError('Upstream unavailable', 503);
   assert.equal(unavailErr.errorClass, 'provider_unavailable');
+  assert.equal(unavailErr.healthStatus, 'temporarily_unavailable');
   assert.equal(unavailErr.retryable, true);
 });
 

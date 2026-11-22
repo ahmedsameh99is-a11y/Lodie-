@@ -42,6 +42,12 @@ import type {
   WorkspaceFileRecord,
   WorkspaceTask,
 } from '../shared/types';
+import type {
+  ChatStreamDoneEvent,
+  ChatStreamErrorEventMeta,
+  ChatStreamMetaEvent,
+} from '../shared/chatStream';
+import { consumeSseReadableStream } from '../shared/chatStream';
 import { getActiveFirebaseIdToken } from './firebase';
 
 async function buildAuthHeaders(extra?: HeadersInit): Promise<HeadersInit> {
@@ -866,27 +872,10 @@ export async function streamChat(params: {
   documentAttachments?: DocumentAttachment[];
   attachments?: ChatAttachment[];
   signal: AbortSignal;
-  onMeta: (meta: {
-    conversationId: string;
-    userMessageId?: string;
-    modelId?: string;
-    resolvedMode?: Exclude<OrchestratorMode, 'auto'>;
-    fallbackFromModelId?: string;
-    fallbackReason?: string;
-    fallbackErrorClass?: ErrorClass;
-    citations?: KnowledgeCitation[];
-  }) => void;
+  onMeta: (meta: ChatStreamMetaEvent) => void;
   onChunk: (text: string) => void;
-  onDone: (done: {
-    conversationId: string;
-    messageId?: string;
-    modelId?: string;
-    fallbackUsed?: string;
-    aborted?: boolean;
-    citations?: KnowledgeCitation[];
-    quota?: { dailyUsed: number; monthlyUsed: number };
-  }) => void;
-  onError: (err: string) => void;
+  onDone: (done: ChatStreamDoneEvent) => void;
+  onError: (err: string, meta?: ChatStreamErrorEventMeta) => void;
 }) {
   const headers = await buildAuthHeaders();
   const resp = await fetch('/api/v1/chat/stream', {
@@ -914,33 +903,14 @@ export async function streamChat(params: {
     throw new Error((data as { error?: string }).error ?? `Request failed (${resp.status})`);
   }
 
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let currentEvent = '';
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      if (line.startsWith('event:')) {
-        currentEvent = line.slice(6).trim();
-      } else if (line.startsWith('data:')) {
-        const jsonStr = line.slice(5).trim();
-        if (!jsonStr) continue;
-        try {
-          const payload = JSON.parse(jsonStr);
-          if (currentEvent === 'meta') params.onMeta(payload);
-          else if (currentEvent === 'chunk') params.onChunk(payload.text ?? '');
-          else if (currentEvent === 'done') params.onDone(payload);
-          else if (currentEvent === 'error') params.onError(payload.error ?? 'Unknown error');
-        } catch {
-          // Ignore malformed event line
-        }
-      }
-    }
-  }
+  await consumeSseReadableStream(
+    resp.body,
+    {
+      onMeta: params.onMeta,
+      onChunk: params.onChunk,
+      onDone: params.onDone,
+      onError: params.onError,
+    },
+    params.signal
+  );
 }

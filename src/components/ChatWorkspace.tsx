@@ -34,7 +34,9 @@ import {
 } from 'lucide-react';
 import { api, streamChat } from '../lib/api';
 import { buildConversationJson, buildConversationMarkdown, triggerBrowserDownload } from '../shared/chatExport';
+import { reconcileStreamMessages } from '../shared/chatStream';
 import { t } from '../shared/i18n';
+import { getModelStatusMeta } from '../shared/modelRegistry';
 import type {
   AppLanguage,
   BrandedModel,
@@ -48,6 +50,7 @@ import type {
   ProjectFileRecord,
   PublicUser,
 } from '../shared/types';
+import { InlineMarkdownErrorBoundary } from './ErrorBoundary';
 import { LoodyLogo } from './LoodyLogo';
 
 interface ChatWorkspaceProps {
@@ -115,7 +118,12 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const [resolvedMode, setResolvedMode] = useState<Exclude<OrchestratorMode, 'auto'> | null>(null);
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [lastFailedPrompt, setLastFailedPrompt] = useState<string | null>(null);
+  const [lastFailedRetry, setLastFailedRetry] = useState<{
+    promptText: string;
+    mode: 'send' | 'regenerate' | 'edit_resend' | 'continue';
+    convId?: string;
+    targetMessageId?: string;
+  } | null>(null);
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [expandedMsgs, setExpandedMsgs] = useState<Record<string, boolean>>({});
@@ -144,6 +152,13 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const activeConvIdRef = useRef<string | null>(activeConvId);
+  activeConvIdRef.current = activeConvId;
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  messagesRef.current = messages;
+  const streamRunCounterRef = useRef(0);
+  const activeStreamRef = useRef<{ runId: number; convId: string | null } | null>(null);
+  const messagesFetchSeqRef = useRef(0);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const docInputRef = useRef<HTMLInputElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
@@ -177,6 +192,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
   useEffect(() => {
     return () => {
+      abortRef.current?.abort();
+      activeStreamRef.current = null;
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
@@ -184,20 +201,55 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   }, []);
 
   useEffect(() => {
-    if (!activeConvId || !user) {
-      setMessages([]);
-      setShareUrl(null);
-      return;
-    }
-    api
-      .getMessages(activeConvId)
-      .then((res) => setMessages(res.messages))
-      .catch(() => setMessages([]));
     if (activeConversation?.shareId) {
       setShareUrl(`${window.location.origin}/?share=${activeConversation.shareId}`);
     } else {
       setShareUrl(null);
     }
+
+    // Do not race a history fetch when onMeta updates activeConvId for the active stream
+    if (activeStreamRef.current && activeStreamRef.current.convId === activeConvId && activeConvId) {
+      return;
+    }
+
+    // Switching away while another stream was active cancels the previous stream cleanly
+    if (activeStreamRef.current && activeStreamRef.current.convId !== activeConvId) {
+      activeStreamRef.current = null;
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setStreaming(false);
+      setStreamingText('');
+    }
+
+    const fetchSeq = ++messagesFetchSeqRef.current;
+
+    if (!activeConvId || !user) {
+      setMessages([]);
+      setShareUrl(null);
+      setError(null);
+      setLastFailedRetry(null);
+      return;
+    }
+
+    const targetConvId = activeConvId;
+    setError(null);
+    setLastFailedRetry(null);
+    setMessages([]);
+
+    api
+      .getMessages(targetConvId)
+      .then((res) => {
+        if (fetchSeq !== messagesFetchSeqRef.current || activeConvIdRef.current !== targetConvId) {
+          return;
+        }
+        setMessages(res.messages);
+      })
+      .catch((err) => {
+        if (fetchSeq !== messagesFetchSeqRef.current || activeConvIdRef.current !== targetConvId) {
+          return;
+        }
+        setError(err instanceof Error ? err.message : 'Unable to load conversation messages.');
+      });
   }, [activeConvId, user?.id]);
 
   useEffect(() => {
@@ -228,9 +280,17 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         };
         reader.readAsDataURL(file);
         if (!supportsVision) {
-          const visionModel = models.find((m) => m.inputModalities.includes('image') && m.availability === 'operational');
-          if (visionModel) {
-            onSelectModel(visionModel.id);
+          const visionModels = models.filter((m) => m.inputModalities.includes('image'));
+          const bestVision =
+            visionModels.find((m) => m.availability === 'operational') ??
+            visionModels.find((m) => getModelStatusMeta(m).callable);
+          if (bestVision) {
+            onSelectModel(bestVision.id);
+          } else if (visionModels.length > 0) {
+            const vm = visionModels[0];
+            setError(
+              `${vm.displayName} is currently ${getModelStatusMeta(vm).badgeLabel.toLowerCase()} (${vm.availabilityReason}). Image attachments cannot route to text-only models.`
+            );
           }
         }
       } else if (
@@ -305,9 +365,14 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     }
     if (!activeModel) return;
 
+    const runId = ++streamRunCounterRef.current;
+    let resolvedConvId = params.convId ?? activeConvId ?? undefined;
+    activeStreamRef.current = { runId, convId: resolvedConvId ?? null };
+    const isCurrentRun = () => activeStreamRef.current?.runId === runId;
+
     setError(null);
     setFallbackNotice(null);
-    setLastFailedPrompt(null);
+    setLastFailedRetry(null);
     setStreaming(true);
     setStreamingText('');
 
@@ -316,8 +381,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
     if (params.mode !== 'regenerate' && params.mode !== 'continue') {
       const tempUserMsg: ChatMessage = {
-        id: `temp-${Date.now()}`,
-        conversationId: params.convId ?? activeConvId ?? 'pending',
+        id: `temp-${Date.now()}-${runId}`,
+        conversationId: resolvedConvId ?? 'pending',
         role: 'user',
         content: params.promptText,
         attachments: [
@@ -327,21 +392,56 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         createdAt: new Date().toISOString(),
       };
       if (params.mode === 'edit_resend' && params.targetMessageId) {
-        const idx = messages.findIndex((m) => m.id === params.targetMessageId);
+        const idx = messagesRef.current.findIndex((m) => m.id === params.targetMessageId);
         if (idx >= 0) {
-          setMessages([...messages.slice(0, idx), tempUserMsg]);
+          setMessages([...messagesRef.current.slice(0, idx), tempUserMsg]);
+        } else {
+          setMessages((prev) => [...prev, tempUserMsg]);
         }
       } else {
         setMessages((prev) => [...prev, tempUserMsg]);
       }
     } else if (params.mode === 'regenerate') {
-      const last = messages[messages.length - 1];
+      const prevMsgs = messagesRef.current;
+      const last = prevMsgs[prevMsgs.length - 1];
       if (last?.role === 'assistant') {
-        setMessages((prev) => prev.slice(0, -1));
+        setMessages(prevMsgs.slice(0, -1));
       }
     }
 
-    let resolvedConvId = params.convId ?? activeConvId ?? undefined;
+    let userMessageIdFromServer: string | undefined;
+    let serverAssistantMessageId: string | undefined;
+    let streamedText = '';
+    let terminalWork: Promise<void> | null = null;
+
+    const reconcileAfterStream = async (opts?: { overrideConvId?: string; overrideAssistantId?: string }) => {
+      const cid = opts?.overrideConvId ?? resolvedConvId;
+      let dbMsgs: ChatMessage[] | null = null;
+      if (cid) {
+        const fetchSeq = ++messagesFetchSeqRef.current;
+        try {
+          const refreshed = await api.getMessages(cid);
+          if (isCurrentRun() && fetchSeq === messagesFetchSeqRef.current) {
+            dbMsgs = refreshed.messages;
+          }
+        } catch {
+          dbMsgs = null;
+        }
+      }
+      if (!isCurrentRun()) return;
+
+      const merged = reconcileStreamMessages({
+        dbMessages: dbMsgs,
+        fallbackMessages: messagesRef.current,
+        streamedText,
+        conversationId: cid ?? 'pending',
+        modelId: activeModel.id,
+        localPartialId: `partial-${runId}`,
+        userMessageIdFromServer,
+        serverAssistantMessageId: opts?.overrideAssistantId ?? serverAssistantMessageId,
+      });
+      setMessages(merged);
+    };
 
     try {
       await streamChat({
@@ -359,6 +459,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         signal: controller.signal,
         onMeta: (meta) => {
           resolvedConvId = meta.conversationId;
+          if (meta.userMessageId) {
+            userMessageIdFromServer = meta.userMessageId;
+          }
+          if (!isCurrentRun()) return;
+          activeStreamRef.current = { runId, convId: meta.conversationId };
           onSelectConvId(meta.conversationId);
           if (meta.resolvedMode) {
             setResolvedMode(meta.resolvedMode);
@@ -373,34 +478,102 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
           }
         },
         onChunk: (chunk) => {
-          setStreamingText((prev) => prev + chunk);
-        },
-        onDone: async (done) => {
-          if (done.quota) onUsageUpdate(done.quota);
-          const cid = done.conversationId || resolvedConvId;
-          if (cid) {
-            onSelectConvId(cid);
-            const refreshed = await api.getMessages(cid);
-            setMessages(refreshed.messages);
+          streamedText += chunk;
+          if (isCurrentRun()) {
+            setStreamingText(streamedText);
           }
-          await onRefreshConversations();
         },
-        onError: (errMsg) => {
-          setError(errMsg);
-          setLastFailedPrompt(params.promptText);
+        onDone: (done) => {
+          terminalWork = (async () => {
+            if (done.messageId) {
+              serverAssistantMessageId = done.messageId;
+            }
+            if (done.quota) onUsageUpdate(done.quota);
+            const cid = done.conversationId || resolvedConvId;
+            if (cid && isCurrentRun()) {
+              activeStreamRef.current = { runId, convId: cid };
+              onSelectConvId(cid);
+            }
+            await reconcileAfterStream({ overrideConvId: cid, overrideAssistantId: done.messageId });
+            if (isCurrentRun()) {
+              setAttachments([]);
+              setDocAttachments([]);
+              if (done.aborted && !streamedText.trim() && !done.messageId) {
+                setError('Generation was stopped before any output was produced.');
+              }
+            }
+            await onRefreshConversations();
+          })();
+        },
+        onError: (errMsg, errMeta) => {
+          terminalWork = (async () => {
+            if (errMeta?.messageId) {
+              serverAssistantMessageId = errMeta.messageId;
+            }
+            const cid = errMeta?.conversationId || resolvedConvId;
+            if (cid && isCurrentRun()) {
+              activeStreamRef.current = { runId, convId: cid };
+              onSelectConvId(cid);
+            }
+            await reconcileAfterStream({ overrideConvId: cid, overrideAssistantId: errMeta?.messageId });
+            if (isCurrentRun()) {
+              if (userMessageIdFromServer) {
+                setAttachments([]);
+                setDocAttachments([]);
+              }
+              setError(errMsg);
+              setLastFailedRetry({
+                promptText: params.promptText,
+                mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
+                convId: cid,
+                targetMessageId: params.targetMessageId,
+              });
+            }
+            if (cid) {
+              await onRefreshConversations();
+            }
+          })();
         },
       });
-      setAttachments([]);
-      setDocAttachments([]);
+      if (terminalWork) {
+        await terminalWork;
+      }
     } catch (err) {
-      if ((err as Error).name !== 'AbortError') {
+      if ((err as Error).name === 'AbortError') {
+        if (isCurrentRun()) {
+          await reconcileAfterStream();
+          if (userMessageIdFromServer) {
+            setAttachments([]);
+            setDocAttachments([]);
+          }
+          if (!streamedText.trim()) {
+            setError('Generation stopped before receiving a response.');
+          }
+          if (resolvedConvId) {
+            await onRefreshConversations();
+          }
+        }
+      } else if (isCurrentRun()) {
+        await reconcileAfterStream();
+        if (userMessageIdFromServer) {
+          setAttachments([]);
+          setDocAttachments([]);
+        }
         setError(err instanceof Error ? err.message : 'Streaming interrupted.');
-        setLastFailedPrompt(params.promptText);
+        setLastFailedRetry({
+          promptText: params.promptText,
+          mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
+          convId: resolvedConvId,
+          targetMessageId: params.targetMessageId,
+        });
       }
     } finally {
-      setStreaming(false);
-      setStreamingText('');
-      abortRef.current = null;
+      if (isCurrentRun()) {
+        setStreaming(false);
+        setStreamingText('');
+        abortRef.current = null;
+        activeStreamRef.current = null;
+      }
     }
   };
 
@@ -596,7 +769,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
               >
                 {models.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.displayName} ({m.availability === 'operational' ? m.speedClass : 'Awaiting Config'})
+                    {m.displayName} ({getModelStatusMeta(m).shortLabel})
                   </option>
                 ))}
               </select>
@@ -923,13 +1096,15 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                       </div>
                     ) : (
                       <div className="prose prose-zinc dark:prose-invert prose-sm max-w-none prose-code:text-emerald-700 dark:prose-code:text-emerald-300">
-                        <ReactMarkdown
-                          remarkPlugins={[remarkGfm, remarkMath]}
-                          rehypePlugins={[rehypeKatex, rehypeHighlight]}
-                          components={markdownComponents}
-                        >
-                          {displayBody}
-                        </ReactMarkdown>
+                        <InlineMarkdownErrorBoundary fallbackText={displayBody} resetKey={displayBody}>
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm, remarkMath]}
+                            rehypePlugins={[rehypeKatex, rehypeHighlight]}
+                            components={markdownComponents}
+                          >
+                            {displayBody}
+                          </ReactMarkdown>
+                        </InlineMarkdownErrorBoundary>
                       </div>
                     )}
 
@@ -1061,12 +1236,18 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                     )}
                   </div>
                   <div className="prose prose-zinc dark:prose-invert prose-sm max-w-none">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm, remarkMath]}
-                      rehypePlugins={[rehypeKatex, rehypeHighlight]}
+                    <InlineMarkdownErrorBoundary
+                      fallbackText={streamingText || '...'}
+                      resetKey={streamingText}
                     >
-                      {streamingText || '...'}
-                    </ReactMarkdown>
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[rehypeKatex, rehypeHighlight]}
+                        components={markdownComponents}
+                      >
+                        {streamingText || '...'}
+                      </ReactMarkdown>
+                    </InlineMarkdownErrorBoundary>
                   </div>
                 </article>
               )}
@@ -1087,10 +1268,10 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 <span>{error}</span>
               </div>
               <div className="flex items-center gap-2">
-                {lastFailedPrompt && !streaming && (
+                {lastFailedRetry && !streaming && (
                   <button
                     type="button"
-                    onClick={() => runStream({ promptText: lastFailedPrompt, mode: 'send' })}
+                    onClick={() => runStream(lastFailedRetry)}
                     className="inline-flex items-center gap-1 rounded-lg bg-red-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-red-500 cursor-pointer"
                   >
                     <RefreshCw className="w-3 h-3" />

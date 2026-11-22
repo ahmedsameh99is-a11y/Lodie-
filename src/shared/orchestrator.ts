@@ -69,10 +69,31 @@ export function classifyProviderError(
     };
   }
 
-  if (httpStatus === 429 || lower.includes('rate limit') || lower.includes('too many requests')) {
+  if (
+    httpStatus === 404 ||
+    lower.includes('model not found') ||
+    lower.includes('not found for api version') ||
+    lower.includes('is not supported for') ||
+    lower.includes('does not exist') ||
+    lower.includes('unknown model')
+  ) {
+    return {
+      errorClass: 'configuration_error',
+      healthStatus: 'configuration_error',
+      retryable: false,
+      userMessage: 'Configured upstream model ID or provider endpoint is invalid or unsupported.',
+    };
+  }
+
+  if (
+    httpStatus === 429 ||
+    lower.includes('rate limit') ||
+    lower.includes('too many requests') ||
+    lower.includes('resource_exhausted')
+  ) {
     return {
       errorClass: 'rate_limit',
-      healthStatus: 'slow',
+      healthStatus: 'temporarily_unavailable',
       retryable: true,
       userMessage: 'Provider rate limit reached temporarily.',
     };
@@ -95,7 +116,7 @@ export function classifyProviderError(
   ) {
     return {
       errorClass: 'latency',
-      healthStatus: 'slow',
+      healthStatus: 'temporarily_unavailable',
       retryable: true,
       userMessage: 'Upstream model timed out under load.',
     };
