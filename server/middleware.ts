@@ -1,7 +1,12 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { DEFAULT_PLAN_LIMITS } from '../src/shared/quotas';
-import type { PublicUser } from '../src/shared/types';
+import { REQUIRED_BRANDED_MODEL_IDS } from '../src/shared/modelRegistry';
+import {
+  DEFAULT_PLAN_LIMITS,
+  getPerModelDailyCap,
+  getUtcQuotaResetTimestamps,
+} from '../src/shared/quotas';
+import type { PerModelDailyQuotaEntry, PublicUser } from '../src/shared/types';
 import { db, mapRowToPublicUser, recordAuditLog } from './db';
 import { verifyFirebaseToken, type VerifiedFirebaseIdentity } from './firebaseAuth';
 import { isDeveloperAllowlisted, parseCookies, SESSION_COOKIE_NAME, verifySessionCookie } from './security';
@@ -115,16 +120,103 @@ export async function attachAuth(req: AuthenticatedRequest, _res: Response, next
     const cookieToken = cookies[SESSION_COOKIE_NAME];
     const payload = verifySessionCookie(cookieToken);
     if (payload) {
-      const row = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.uid) as
+      let row = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.uid) as
         | Record<string, unknown>
         | undefined;
       if (row) {
+        const email = String(row.email ?? '');
+        if (email && isDeveloperAllowlisted(email) && (row.role !== 'developer' || row.plan !== 'developer')) {
+          const devLimits = DEFAULT_PLAN_LIMITS.developer;
+          db.prepare(
+            'UPDATE users SET role = ?, plan = ?, daily_token_limit = ?, monthly_token_limit = ?, updated_at = ? WHERE id = ?'
+          ).run('developer', 'developer', devLimits.daily, devLimits.monthly, new Date().toISOString(), String(row.id));
+          row = (db.prepare('SELECT * FROM users WHERE id = ?').get(payload.uid) as Record<string, unknown> | undefined) ?? row;
+        }
         req.authUser = mapRowToPublicUser(row);
       }
     }
   } catch {
     // Ignore malformed auth headers cleanly
   }
+  next();
+}
+
+function getAllowedRequestHosts(req: Request): Set<string> {
+  const hosts = new Set<string>();
+  const forwardedHost = String(req.headers['x-forwarded-host'] ?? '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const rawHost = String(req.headers.host ?? '')
+    .trim()
+    .toLowerCase();
+  if (forwardedHost) hosts.add(forwardedHost);
+  if (rawHost) hosts.add(rawHost);
+  if (process.env.APP_URL) {
+    try {
+      hosts.add(new URL(process.env.APP_URL).host.toLowerCase());
+    } catch {
+      // Ignore malformed APP_URL
+    }
+  }
+  return hosts;
+}
+
+export function csrfOriginCheck(req: Request, res: Response, next: NextFunction): void {
+  const method = req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    next();
+    return;
+  }
+
+  // Bearer-authenticated API/MCP requests are not ambiently attached by browsers and are CSRF-immune
+  if (req.headers.authorization?.startsWith('Bearer ')) {
+    next();
+    return;
+  }
+
+  const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+  const refererHeader = typeof req.headers.referer === 'string' ? req.headers.referer.trim() : '';
+  const secFetchSite = typeof req.headers['sec-fetch-site'] === 'string' ? req.headers['sec-fetch-site'].toLowerCase() : '';
+  const allowedHosts = getAllowedRequestHosts(req);
+
+  if (originHeader) {
+    let originHost = '';
+    try {
+      originHost = new URL(originHeader).host.toLowerCase();
+    } catch {
+      res.status(403).json({ error: 'Cross-origin request rejected: invalid Origin header.', code: 'CSRF_REJECTED' });
+      return;
+    }
+    if (allowedHosts.size > 0 && !allowedHosts.has(originHost)) {
+      res.status(403).json({ error: 'Cross-origin request rejected: Origin mismatch.', code: 'CSRF_REJECTED' });
+      return;
+    }
+    next();
+    return;
+  }
+
+  if (refererHeader) {
+    let refererHost = '';
+    try {
+      refererHost = new URL(refererHeader).host.toLowerCase();
+    } catch {
+      res.status(403).json({ error: 'Cross-origin request rejected: invalid Referer header.', code: 'CSRF_REJECTED' });
+      return;
+    }
+    if (allowedHosts.size > 0 && !allowedHosts.has(refererHost)) {
+      res.status(403).json({ error: 'Cross-origin request rejected: Referer mismatch.', code: 'CSRF_REJECTED' });
+      return;
+    }
+    next();
+    return;
+  }
+
+  if (secFetchSite === 'cross-site') {
+    res.status(403).json({ error: 'Cross-site cookie mutation blocked by CSRF policy.', code: 'CSRF_REJECTED' });
+    return;
+  }
+
   next();
 }
 
@@ -180,5 +272,60 @@ export function getUserQuotaUsage(userId: string): {
   return {
     dailyUsed: Number(dayRow?.total ?? 0),
     monthlyUsed: Number(monthRow?.total ?? 0),
+  };
+}
+
+export function getDetailedUserQuota(
+  user: Pick<PublicUser, 'id' | 'plan' | 'dailyTokenLimit' | 'monthlyTokenLimit'>
+): {
+  dailyUsed: number;
+  dailyLimit: number;
+  dailyRemaining: number;
+  monthlyUsed: number;
+  monthlyLimit: number;
+  monthlyRemaining: number;
+  dailyResetAtUtc: string;
+  monthlyResetAtUtc: string;
+  perModelDaily: PerModelDailyQuotaEntry[];
+  byModelToday: Record<string, number>;
+} {
+  const now = new Date();
+  const usageDate = now.toISOString().slice(0, 10);
+  const base = getUserQuotaUsage(user.id);
+  const { dailyResetAtUtc, monthlyResetAtUtc } = getUtcQuotaResetTimestamps(now);
+
+  const modelRows = db
+    .prepare(
+      'SELECT model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS total FROM token_usage WHERE user_id = ? AND usage_date = ? GROUP BY model_id'
+    )
+    .all(user.id, usageDate) as Array<{ model_id: string; total: number }>;
+
+  const byModelToday: Record<string, number> = {};
+  for (const r of modelRows) {
+    byModelToday[String(r.model_id)] = Number(r.total ?? 0);
+  }
+
+  const perModelDaily: PerModelDailyQuotaEntry[] = REQUIRED_BRANDED_MODEL_IDS.map((modelId) => {
+    const used = byModelToday[modelId] ?? 0;
+    const limit = getPerModelDailyCap(user.plan, modelId);
+    return {
+      modelId,
+      used,
+      limit,
+      remaining: Math.max(0, limit - used),
+    };
+  });
+
+  return {
+    dailyUsed: base.dailyUsed,
+    dailyLimit: user.dailyTokenLimit,
+    dailyRemaining: Math.max(0, user.dailyTokenLimit - base.dailyUsed),
+    monthlyUsed: base.monthlyUsed,
+    monthlyLimit: user.monthlyTokenLimit,
+    monthlyRemaining: Math.max(0, user.monthlyTokenLimit - base.monthlyUsed),
+    dailyResetAtUtc,
+    monthlyResetAtUtc,
+    perModelDaily,
+    byModelToday,
   };
 }

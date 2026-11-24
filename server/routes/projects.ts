@@ -3,7 +3,14 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { classifyFileCategory } from '../../src/shared/rag';
 import { db } from '../db';
-import { deleteKnowledgeSourceChunks, extractDocumentContent, indexKnowledgeSource } from '../knowledge';
+import {
+  deleteKnowledgeSourceChunks,
+  extractDocumentContent,
+  indexKnowledgeSource,
+  removeUserBinaryFile,
+  resolveUserBinaryPath,
+  saveUserBinaryFile,
+} from '../knowledge';
 import { type AuthenticatedRequest, requireAuth } from '../middleware';
 import { createRateLimiter, inspectUploadedBinarySafety } from '../security';
 
@@ -143,13 +150,31 @@ projectsRouter.patch('/:id', (req: AuthenticatedRequest, res) => {
 });
 
 projectsRouter.delete('/:id', (req: AuthenticatedRequest, res) => {
+  const userId = req.authUser!.id;
+  const projectFiles = db
+    .prepare('SELECT id, storage_rel_path FROM project_files WHERE project_id = ? AND user_id = ?')
+    .all(req.params.id, userId) as Array<{ id: string; storage_rel_path: string | null }>;
+  const projectMemories = db
+    .prepare('SELECT id FROM user_memories WHERE project_id = ? AND user_id = ?')
+    .all(req.params.id, userId) as Array<{ id: string }>;
+
   const result = db
     .prepare('DELETE FROM projects WHERE id = ? AND user_id = ?')
-    .run(req.params.id, req.authUser!.id);
+    .run(req.params.id, userId);
   if (result.changes === 0) {
     res.status(404).json({ error: 'Project not found.' });
     return;
   }
+
+  for (const pf of projectFiles) {
+    removeUserBinaryFile(pf.storage_rel_path);
+    deleteKnowledgeSourceChunks(userId, pf.id);
+  }
+  for (const mem of projectMemories) {
+    deleteKnowledgeSourceChunks(userId, mem.id);
+  }
+  db.prepare('DELETE FROM knowledge_chunks WHERE user_id = ? AND project_id = ?').run(userId, req.params.id);
+
   res.json({ ok: true });
 });
 
@@ -212,7 +237,8 @@ projectsRouter.get('/:id/files', (req: AuthenticatedRequest, res) => {
       mimeType: String(r.mime_type),
       sizeBytes: Number(r.size_bytes),
       extractedText: String(r.extracted_text),
-      fileCategory: (r.file_category ? String(r.file_category) : classifyFileCategory(String(r.name), String(r.mime_type))),
+      fileCategory: r.file_category ? String(r.file_category) : classifyFileCategory(String(r.name), String(r.mime_type)),
+      hasBinary: Boolean(r.storage_rel_path),
       createdAt: String(r.created_at),
     })),
   });
@@ -239,7 +265,29 @@ projectsRouter.post('/:id/files', projectFileLimiter, async (req: AuthenticatedR
     return;
   }
 
-  const buffer = parsed.data.dataBase64 ? Buffer.from(parsed.data.dataBase64, 'base64') : undefined;
+  let buffer: Buffer | undefined;
+  if (parsed.data.dataBase64 !== undefined) {
+    const cleanB64 = parsed.data.dataBase64.replace(/\s+/g, '');
+    if (!cleanB64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleanB64) || cleanB64.length % 4 !== 0) {
+      res.status(400).json({ error: 'Invalid base64 file payload.' });
+      return;
+    }
+    buffer = Buffer.from(cleanB64, 'base64');
+    if (buffer.length === 0) {
+      res.status(400).json({ error: 'Empty (0-byte) files cannot be uploaded.' });
+      return;
+    }
+    if (buffer.length > 4_000_000) {
+      res.status(400).json({ error: 'Decoded project file exceeds 4 MB limit.' });
+      return;
+    }
+  } else if (parsed.data.extractedText.length > 0) {
+    buffer = Buffer.from(parsed.data.extractedText, 'utf8');
+  } else {
+    res.status(400).json({ error: 'Empty (0-byte) files cannot be uploaded.' });
+    return;
+  }
+
   const safety = inspectUploadedBinarySafety({
     fileName: parsed.data.name,
     mimeType: parsed.data.mimeType,
@@ -258,24 +306,33 @@ projectsRouter.post('/:id/files', projectFileLimiter, async (req: AuthenticatedR
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO project_files (id, project_id, user_id, name, mime_type, size_bytes, extracted_text, file_category, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    req.params.id,
-    req.authUser!.id,
-    parsed.data.name,
-    parsed.data.mimeType,
-    parsed.data.sizeBytes,
-    extracted.extractedText,
-    extracted.fileCategory,
-    now
-  );
+  const userId = req.authUser!.id;
+  const storageRelPath = buffer ? saveUserBinaryFile({ userId, fileId: id, buffer }) : null;
+
+  try {
+    db.prepare(`
+      INSERT INTO project_files (id, project_id, user_id, name, mime_type, size_bytes, extracted_text, storage_rel_path, file_category, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      req.params.id,
+      userId,
+      parsed.data.name,
+      parsed.data.mimeType,
+      parsed.data.sizeBytes,
+      extracted.extractedText,
+      storageRelPath,
+      extracted.fileCategory,
+      now
+    );
+  } catch (dbErr) {
+    removeUserBinaryFile(storageRelPath);
+    throw dbErr;
+  }
 
   if (extracted.extractedText.length > 10) {
     await indexKnowledgeSource({
-      userId: req.authUser!.id,
+      userId,
       sourceType: 'project_file',
       sourceId: id,
       projectId: String(req.params.id),
@@ -289,25 +346,58 @@ projectsRouter.post('/:id/files', projectFileLimiter, async (req: AuthenticatedR
     file: {
       id,
       projectId: req.params.id,
-      userId: req.authUser!.id,
+      userId,
       name: parsed.data.name,
       mimeType: parsed.data.mimeType,
       sizeBytes: parsed.data.sizeBytes,
       extractedText: extracted.extractedText,
       fileCategory: extracted.fileCategory,
+      hasBinary: Boolean(storageRelPath),
       createdAt: now,
     },
   });
 });
 
+projectsRouter.get('/:id/files/:fileId/download', (req: AuthenticatedRequest, res) => {
+  const row = db
+    .prepare('SELECT * FROM project_files WHERE id = ? AND project_id = ? AND user_id = ?')
+    .get(req.params.fileId, req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Project file not found.' });
+    return;
+  }
+
+  const safeName = String(row.name).replace(/["\r\n]/g, '_');
+  const mime = String(row.mime_type || 'application/octet-stream');
+  const inline = req.query.inline === '1';
+
+  res.setHeader('Content-Type', mime);
+  res.setHeader('Content-Security-Policy', 'sandbox');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
+
+  const binPath = resolveUserBinaryPath(row.storage_rel_path ? String(row.storage_rel_path) : null);
+  if (binPath) {
+    res.sendFile(binPath);
+    return;
+  }
+  res.send(Buffer.from(String(row.extracted_text ?? ''), 'utf8'));
+});
+
 projectsRouter.delete('/:id/files/:fileId', (req: AuthenticatedRequest, res) => {
-  const result = db
-    .prepare('DELETE FROM project_files WHERE id = ? AND project_id = ? AND user_id = ?')
-    .run(req.params.fileId, req.params.id, req.authUser!.id);
-  if (result.changes === 0) {
+  const existing = db
+    .prepare('SELECT storage_rel_path FROM project_files WHERE id = ? AND project_id = ? AND user_id = ?')
+    .get(req.params.fileId, req.params.id, req.authUser!.id) as { storage_rel_path?: string | null } | undefined;
+  if (!existing) {
     res.status(404).json({ error: 'File not found.' });
     return;
   }
+  db.prepare('DELETE FROM project_files WHERE id = ? AND project_id = ? AND user_id = ?').run(
+    req.params.fileId,
+    req.params.id,
+    req.authUser!.id
+  );
   deleteKnowledgeSourceChunks(req.authUser!.id, String(req.params.fileId));
+  removeUserBinaryFile(existing.storage_rel_path);
   res.json({ ok: true });
 });

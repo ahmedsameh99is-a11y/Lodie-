@@ -466,6 +466,7 @@ export default function App() {
               onSelectProject={setActiveProjectId}
               onOpenSidebar={() => setSidebarOpen(true)}
               onOpenModelHub={() => setActiveView('models')}
+              onOpenUsage={() => setActiveView('usage')}
               onOpenAuth={() => setAuthModalOpen(true)}
               onRefreshConversations={() => loadConversations(Boolean(user))}
               onUsageUpdate={setUsage}

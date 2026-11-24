@@ -28,6 +28,11 @@ test('classifyProviderError distinguishes auth, rate limit, quota, latency, and 
   assert.equal(authErr.healthStatus, 'authentication_error');
   assert.equal(authErr.retryable, false);
 
+  const anthropicAuthErr = classifyProviderError('invalid x-api-key provided', 401);
+  assert.equal(anthropicAuthErr.errorClass, 'auth_error');
+  assert.equal(anthropicAuthErr.healthStatus, 'authentication_error');
+  assert.equal(anthropicAuthErr.retryable, false);
+
   const cfgErr = classifyProviderError('Provider API key is not configured', 401);
   assert.equal(cfgErr.errorClass, 'configuration_error');
   assert.equal(cfgErr.healthStatus, 'configuration_error');
@@ -37,7 +42,7 @@ test('classifyProviderError distinguishes auth, rate limit, quota, latency, and 
   assert.equal(rateErr.healthStatus, 'temporarily_unavailable');
   assert.equal(rateErr.retryable, true);
 
-  const quotaErr = classifyProviderError('insufficient_quota billing cap reached');
+  const quotaErr = classifyProviderError('You exceeded your current quota (insufficient_quota)', 429);
   assert.equal(quotaErr.errorClass, 'quota_exceeded');
   assert.equal(quotaErr.healthStatus, 'temporarily_unavailable');
   assert.equal(quotaErr.retryable, false);

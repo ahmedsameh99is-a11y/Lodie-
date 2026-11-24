@@ -24,13 +24,16 @@ import type {
   KoreFileRecord,
   KoreReviewRecord,
   KoreWorkspaceRecord,
+  MatrixRouteDescriptor,
   McpApprovalRequest,
   McpServerRecord,
   McpServerTokenRecord,
   MemoryScope,
   OrchestratorMode,
+  PerModelDailyQuotaEntry,
   Project,
   ProjectFileRecord,
+  ProviderStatusSummary,
   PublicUser,
   ResearchReport,
   SkillPackage,
@@ -59,6 +62,20 @@ async function buildAuthHeaders(extra?: HeadersInit): Promise<HeadersInit> {
   };
 }
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  details?: Record<string, unknown>;
+
+  constructor(message: string, opts: { status: number; code?: string; details?: Record<string, unknown> }) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = opts.status;
+    this.code = opts.code;
+    this.details = opts.details;
+  }
+}
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = await buildAuthHeaders(init?.headers);
   const resp = await fetch(url, {
@@ -66,36 +83,87 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
     headers,
   });
-  const data = await resp.json().catch(() => ({}));
+  const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
   if (!resp.ok) {
-    throw new Error((data as { error?: string }).error ?? `Request failed (${resp.status})`);
+    throw new ApiError(typeof data.error === 'string' ? data.error : `Request failed (${resp.status})`, {
+      status: resp.status,
+      code: typeof data.code === 'string' ? data.code : undefined,
+      details: data,
+    });
   }
   return data as T;
 }
 
 export const api = {
   getSession: () =>
-    requestJson<{ user: PublicUser | null; usage: { dailyUsed: number; monthlyUsed: number } | null }>(
-      '/api/v1/auth/me'
-    ),
+    requestJson<{
+      user: PublicUser | null;
+      usage: {
+        dailyUsed: number;
+        dailyLimit?: number;
+        dailyRemaining?: number;
+        monthlyUsed: number;
+        monthlyLimit?: number;
+        monthlyRemaining?: number;
+        dailyResetAtUtc?: string;
+        monthlyResetAtUtc?: string;
+        perModelDaily?: PerModelDailyQuotaEntry[];
+      } | null;
+    }>('/api/v1/auth/me'),
 
   firebaseExchange: (token: string) =>
-    requestJson<{ user: PublicUser; usage: { dailyUsed: number; monthlyUsed: number } }>(
-      '/api/v1/auth/firebase-exchange',
-      {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      }
-    ),
+    requestJson<{
+      user: PublicUser;
+      usage: {
+        dailyUsed: number;
+        dailyLimit?: number;
+        dailyRemaining?: number;
+        monthlyUsed: number;
+        monthlyLimit?: number;
+        monthlyRemaining?: number;
+        dailyResetAtUtc?: string;
+        monthlyResetAtUtc?: string;
+        perModelDaily?: PerModelDailyQuotaEntry[];
+      };
+    }>('/api/v1/auth/firebase-exchange', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }),
 
   register: (payload: { email: string; password: string; displayName: string; language?: AppLanguage }) =>
-    requestJson<{ user: PublicUser; usage: { dailyUsed: number; monthlyUsed: number } }>('/api/v1/auth/register', {
+    requestJson<{
+      user: PublicUser;
+      usage: {
+        dailyUsed: number;
+        dailyLimit?: number;
+        dailyRemaining?: number;
+        monthlyUsed: number;
+        monthlyLimit?: number;
+        monthlyRemaining?: number;
+        dailyResetAtUtc?: string;
+        monthlyResetAtUtc?: string;
+        perModelDaily?: PerModelDailyQuotaEntry[];
+      };
+    }>('/api/v1/auth/register', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
 
   login: (payload: { email: string; password: string }) =>
-    requestJson<{ user: PublicUser; usage: { dailyUsed: number; monthlyUsed: number } }>('/api/v1/auth/login', {
+    requestJson<{
+      user: PublicUser;
+      usage: {
+        dailyUsed: number;
+        dailyLimit?: number;
+        dailyRemaining?: number;
+        monthlyUsed: number;
+        monthlyLimit?: number;
+        monthlyRemaining?: number;
+        dailyResetAtUtc?: string;
+        monthlyResetAtUtc?: string;
+        perModelDaily?: PerModelDailyQuotaEntry[];
+      };
+    }>('/api/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
@@ -156,6 +224,24 @@ export const api = {
       testResult: { ok: boolean; latencyMs: number; message: string; errorClass?: ErrorClass | null };
       model: BrandedModel;
     }>(`/api/v1/models/admin/${id}/test`, { method: 'POST' }),
+
+  getModelMatrix: () =>
+    requestJson<{
+      providers: ProviderStatusSummary[];
+      matrix: Record<string, MatrixRouteDescriptor[]>;
+      unsupportedNotes: Array<{ provider: string; reason: string }>;
+    }>('/api/v1/models/matrix'),
+
+  testProviderEndpoint: (providerId: string) =>
+    requestJson<{
+      testResult: { ok: boolean; latencyMs: number; message: string; errorClass?: ErrorClass | null };
+      provider: ProviderStatusSummary | null;
+    }>(`/api/v1/models/providers/${providerId}/test`, { method: 'POST' }),
+
+  resetProviderCircuitBreaker: (providerId: string) =>
+    requestJson<{ provider: ProviderStatusSummary | null }>(`/api/v1/models/providers/${providerId}/reset-circuit`, {
+      method: 'POST',
+    }),
 
   getConversations: (params?: { q?: string; projectId?: string; folder?: string; archived?: '1' | 'all' }) => {
     const sp = new URLSearchParams();
@@ -277,6 +363,9 @@ export const api = {
     requestJson<{ ok: boolean }>(`/api/v1/projects/${projectId}/files/${fileId}`, {
       method: 'DELETE',
     }),
+
+  getProjectFileDownloadUrl: (projectId: string, fileId: string, inline = false) =>
+    `/api/v1/projects/${projectId}/files/${fileId}/download${inline ? '?inline=1' : ''}`,
 
   getFiles: (params?: { q?: string; folder?: string; category?: FileCategory | '' }) => {
     const sp = new URLSearchParams();
@@ -877,6 +966,11 @@ export async function streamChat(params: {
   onDone: (done: ChatStreamDoneEvent) => void;
   onError: (err: string, meta?: ChatStreamErrorEventMeta) => void;
 }) {
+  const tRequestStart = performance.now();
+  const clientTimings: Record<string, unknown> = {
+    modelId: params.modelId,
+  };
+
   const headers = await buildAuthHeaders();
   const resp = await fetch('/api/v1/chat/stream', {
     method: 'POST',
@@ -897,19 +991,57 @@ export async function streamChat(params: {
       attachments: params.attachments,
     }),
   });
+  clientTimings.headersMs = Math.round(performance.now() - tRequestStart);
 
   if (!resp.ok || !resp.body) {
-    const data = await resp.json().catch(() => ({}));
-    throw new Error((data as { error?: string }).error ?? `Request failed (${resp.status})`);
+    const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+    throw new ApiError(typeof data.error === 'string' ? data.error : `Request failed (${resp.status})`, {
+      status: resp.status,
+      code: typeof data.code === 'string' ? data.code : undefined,
+      details: data,
+    });
   }
+
+  let firstEventRecorded = false;
+  let firstChunkRecorded = false;
+  const recordClientTimings = () => {
+    if (typeof window !== 'undefined') {
+      (window as unknown as { __LOODY_LAST_STREAM_TIMINGS__?: Record<string, unknown> }).__LOODY_LAST_STREAM_TIMINGS__ = {
+        ...clientTimings,
+      };
+    }
+  };
 
   await consumeSseReadableStream(
     resp.body,
     {
-      onMeta: params.onMeta,
-      onChunk: params.onChunk,
-      onDone: params.onDone,
-      onError: params.onError,
+      onMeta: (meta) => {
+        if (!firstEventRecorded) {
+          firstEventRecorded = true;
+          clientTimings.firstEventMs = Math.round(performance.now() - tRequestStart);
+        }
+        params.onMeta(meta);
+      },
+      onChunk: (text) => {
+        if (!firstChunkRecorded) {
+          firstChunkRecorded = true;
+          clientTimings.firstChunkMs = Math.round(performance.now() - tRequestStart);
+        }
+        params.onChunk(text);
+      },
+      onDone: (done) => {
+        clientTimings.doneMs = Math.round(performance.now() - tRequestStart);
+        if (done.timingsMs) {
+          clientTimings.serverTimings = done.timingsMs;
+        }
+        recordClientTimings();
+        params.onDone(done);
+      },
+      onError: (errMsg, errMeta) => {
+        clientTimings.errorMs = Math.round(performance.now() - tRequestStart);
+        recordClientTimings();
+        params.onError(errMsg, errMeta);
+      },
     },
     params.signal
   );

@@ -8,6 +8,7 @@ import {
   mapRowToPublicUser,
   recordAuditLog,
 } from '../db';
+import { indexKnowledgeSource } from '../knowledge';
 import { type AuthenticatedRequest, requireAuth, requireDeveloper } from '../middleware';
 import { createRateLimiter } from '../security';
 
@@ -146,7 +147,7 @@ const restoreSchema = z.object({
   researchReports: z.array(z.record(z.string(), z.unknown())).max(300).optional().default([]),
 });
 
-settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: AuthenticatedRequest, res) => {
+settingsRouter.post('/restore', requireAuth, restoreLimiter, async (req: AuthenticatedRequest, res) => {
   const parsed = restoreSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid backup JSON structure.' });
@@ -176,11 +177,38 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
     researchReports: 0,
   };
 
-  function allocateOwnedId(table: string, ownerCol: string, rawId: string | undefined): { id: string; alreadyOwned: boolean } {
+  type RestorableTable =
+    | 'projects'
+    | 'project_files'
+    | 'conversations'
+    | 'messages'
+    | 'workspace_files'
+    | 'user_memories'
+    | 'skills_registry'
+    | 'project_tasks'
+    | 'task_subtasks'
+    | 'task_milestones'
+    | 'kore_workspaces'
+    | 'research_reports';
+
+  const ownerLookupSql: Record<RestorableTable, string> = {
+    projects: 'SELECT user_id AS owner FROM projects WHERE id = ?',
+    project_files: 'SELECT user_id AS owner FROM project_files WHERE id = ?',
+    conversations: 'SELECT user_id AS owner FROM conversations WHERE id = ?',
+    messages: 'SELECT user_id AS owner FROM messages WHERE id = ?',
+    workspace_files: 'SELECT user_id AS owner FROM workspace_files WHERE id = ?',
+    user_memories: 'SELECT user_id AS owner FROM user_memories WHERE id = ?',
+    skills_registry: 'SELECT owner_user_id AS owner FROM skills_registry WHERE id = ?',
+    project_tasks: 'SELECT user_id AS owner FROM project_tasks WHERE id = ?',
+    task_subtasks: 'SELECT user_id AS owner FROM task_subtasks WHERE id = ?',
+    task_milestones: 'SELECT user_id AS owner FROM task_milestones WHERE id = ?',
+    kore_workspaces: 'SELECT user_id AS owner FROM kore_workspaces WHERE id = ?',
+    research_reports: 'SELECT user_id AS owner FROM research_reports WHERE id = ?',
+  };
+
+  function allocateOwnedId(table: RestorableTable, rawId: string | undefined): { id: string; alreadyOwned: boolean } {
     if (rawId && rawId.trim().length > 0 && rawId.length <= 120) {
-      const existing = db.prepare(`SELECT ${ownerCol} AS owner FROM ${table} WHERE id = ?`).get(rawId) as
-        | { owner: string | null }
-        | undefined;
+      const existing = db.prepare(ownerLookupSql[table]).get(rawId) as { owner: string | null } | undefined;
       if (!existing) {
         return { id: rawId, alreadyOwned: false };
       }
@@ -191,10 +219,18 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
     return { id: crypto.randomUUID(), alreadyOwned: false };
   }
 
+  const ragToIndex: Array<{
+    sourceType: 'workspace_file' | 'project_file' | 'memory';
+    sourceId: string;
+    projectId: string | null;
+    title: string;
+    text: string;
+  }> = [];
+
   const runRestore = db.transaction(() => {
     for (const raw of data.projects) {
       const oldId = typeof raw.id === 'string' ? raw.id : '';
-      const alloc = allocateOwnedId('projects', 'user_id', oldId || undefined);
+      const alloc = allocateOwnedId('projects', oldId || undefined);
       if (oldId) projectIdMap.set(oldId, alloc.id);
       if (alloc.alreadyOwned) continue;
       db.prepare(`
@@ -220,8 +256,10 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
       const oldProjId = typeof raw.project_id === 'string' ? raw.project_id : typeof raw.projectId === 'string' ? raw.projectId : '';
       const mappedProjId = projectIdMap.get(oldProjId);
       if (!mappedProjId) continue;
-      const alloc = allocateOwnedId('project_files', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('project_files', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
+      const pFileName = String(raw.name ?? 'restored-file.txt').slice(0, 180);
+      const pExtractedText = String(raw.extracted_text ?? raw.extractedText ?? '').slice(0, 150_000);
       db.prepare(`
         INSERT INTO project_files (id, project_id, user_id, name, mime_type, size_bytes, extracted_text, summary, file_category, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -229,20 +267,29 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
         alloc.id,
         mappedProjId,
         userId,
-        String(raw.name ?? 'restored-file.txt').slice(0, 180),
+        pFileName,
         String(raw.mime_type ?? raw.mimeType ?? 'text/plain').slice(0, 120),
         Math.max(0, Number(raw.size_bytes ?? raw.sizeBytes ?? 0)),
-        String(raw.extracted_text ?? raw.extractedText ?? '').slice(0, 150_000),
+        pExtractedText,
         String(raw.summary ?? '').slice(0, 4000),
         String(raw.file_category ?? raw.fileCategory ?? 'text').slice(0, 40),
         String(raw.created_at ?? raw.createdAt ?? now)
       );
+      if (pExtractedText.length > 10) {
+        ragToIndex.push({
+          sourceType: 'project_file',
+          sourceId: alloc.id,
+          projectId: mappedProjId,
+          title: pFileName,
+          text: pExtractedText,
+        });
+      }
       counts.projectFiles++;
     }
 
     for (const raw of data.conversations) {
       const oldId = typeof raw.id === 'string' ? raw.id : '';
-      const alloc = allocateOwnedId('conversations', 'user_id', oldId || undefined);
+      const alloc = allocateOwnedId('conversations', oldId || undefined);
       if (oldId) convIdMap.set(oldId, alloc.id);
       if (alloc.alreadyOwned) continue;
       const oldProj = typeof raw.project_id === 'string' ? raw.project_id : typeof raw.projectId === 'string' ? raw.projectId : '';
@@ -269,14 +316,15 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
       const oldConv = typeof raw.conversation_id === 'string' ? raw.conversation_id : typeof raw.conversationId === 'string' ? raw.conversationId : '';
       const mappedConv = convIdMap.get(oldConv);
       if (!mappedConv) continue;
-      const alloc = allocateOwnedId('messages', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('messages', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
       const roleVal = raw.role === 'assistant' || raw.role === 'system' ? raw.role : 'user';
+      const upstreamModel = raw.upstream_model_id ?? raw.upstreamModelId;
       db.prepare(`
         INSERT INTO messages (
           id, conversation_id, user_id, role, content, attachments_json, citations_json,
-          model_id, provider, input_tokens, output_tokens, cached_tokens, token_accounting_type, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          model_id, provider, upstream_model_id, input_tokens, output_tokens, cached_tokens, token_accounting_type, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         alloc.id,
         mappedConv,
@@ -287,6 +335,7 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
         raw.citations_json ? String(raw.citations_json) : null,
         raw.model_id ? String(raw.model_id) : null,
         raw.provider ? String(raw.provider) : null,
+        upstreamModel ? String(upstreamModel) : null,
         raw.input_tokens !== undefined && raw.input_tokens !== null ? Number(raw.input_tokens) : null,
         raw.output_tokens !== undefined && raw.output_tokens !== null ? Number(raw.output_tokens) : null,
         raw.cached_tokens !== undefined && raw.cached_tokens !== null ? Number(raw.cached_tokens) : null,
@@ -297,8 +346,10 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
     }
 
     for (const raw of data.files) {
-      const alloc = allocateOwnedId('workspace_files', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('workspace_files', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
+      const wFileName = String(raw.name ?? 'restored-doc.txt').slice(0, 180);
+      const wExtractedText = String(raw.extracted_text ?? raw.extractedText ?? '').slice(0, 150_000);
       db.prepare(`
         INSERT INTO workspace_files (
           id, user_id, name, mime_type, size_bytes, extracted_text, folder, tags_json, summary, file_category, created_at
@@ -306,21 +357,30 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
       `).run(
         alloc.id,
         userId,
-        String(raw.name ?? 'restored-doc.txt').slice(0, 180),
+        wFileName,
         String(raw.mime_type ?? raw.mimeType ?? 'text/plain').slice(0, 120),
         Math.max(0, Number(raw.size_bytes ?? raw.sizeBytes ?? 0)),
-        String(raw.extracted_text ?? raw.extractedText ?? '').slice(0, 150_000),
+        wExtractedText,
         String(raw.folder ?? '').slice(0, 80),
         typeof raw.tags_json === 'string' ? raw.tags_json : JSON.stringify(Array.isArray(raw.tags) ? raw.tags : []),
         String(raw.summary ?? '').slice(0, 4000),
         String(raw.file_category ?? raw.fileCategory ?? 'text').slice(0, 40),
         String(raw.created_at ?? raw.createdAt ?? now)
       );
+      if (wExtractedText.length > 10) {
+        ragToIndex.push({
+          sourceType: 'workspace_file',
+          sourceId: alloc.id,
+          projectId: null,
+          title: wFileName,
+          text: wExtractedText,
+        });
+      }
       counts.files++;
     }
 
     for (const raw of data.memories) {
-      const alloc = allocateOwnedId('user_memories', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('user_memories', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
       const oldProj = typeof raw.project_id === 'string' ? raw.project_id : typeof raw.projectId === 'string' ? raw.projectId : '';
       const mappedProj = oldProj ? projectIdMap.get(oldProj) ?? null : null;
@@ -330,6 +390,8 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
         : 'user';
       const catRaw = String(raw.category ?? 'fact');
       const validCat = ['preference', 'fact', 'instruction'].includes(catRaw) ? catRaw : 'fact';
+      const memContent = String(raw.content ?? '').slice(0, 2000);
+      const isApproved = raw.approved === 0 || raw.approved === false ? 0 : 1;
       db.prepare(`
         INSERT INTO user_memories (id, user_id, project_id, scope, category, content, source_type, approved, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -339,17 +401,26 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
         mappedProj,
         validScope,
         validCat,
-        String(raw.content ?? '').slice(0, 2000),
+        memContent,
         raw.source_type === 'extracted' ? 'extracted' : 'user_approved',
-        raw.approved === 0 || raw.approved === false ? 0 : 1,
+        isApproved,
         String(raw.created_at ?? raw.createdAt ?? now),
         String(raw.updated_at ?? raw.updatedAt ?? now)
       );
+      if (isApproved === 1 && memContent.length > 10) {
+        ragToIndex.push({
+          sourceType: 'memory',
+          sourceId: alloc.id,
+          projectId: mappedProj,
+          title: `Memory (${validScope})`,
+          text: memContent,
+        });
+      }
       counts.memories++;
     }
 
     for (const raw of data.skills) {
-      const alloc = allocateOwnedId('skills_registry', 'owner_user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('skills_registry', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
       const oldProj = typeof raw.project_id === 'string' ? raw.project_id : '';
       const mappedProj = oldProj ? projectIdMap.get(oldProj) ?? null : null;
@@ -380,7 +451,7 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
 
     for (const raw of data.tasks) {
       const oldId = typeof raw.id === 'string' ? raw.id : '';
-      const alloc = allocateOwnedId('project_tasks', 'user_id', oldId || undefined);
+      const alloc = allocateOwnedId('project_tasks', oldId || undefined);
       if (oldId) taskIdMap.set(oldId, alloc.id);
       if (alloc.alreadyOwned) continue;
       const oldProj = typeof raw.project_id === 'string' ? raw.project_id : '';
@@ -409,7 +480,7 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
     for (const raw of data.taskSubtasks) {
       const mappedTask = taskIdMap.get(String(raw.task_id ?? ''));
       if (!mappedTask) continue;
-      const alloc = allocateOwnedId('task_subtasks', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('task_subtasks', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
       db.prepare(`
         INSERT INTO task_subtasks (id, task_id, user_id, title, completed, sort_order)
@@ -420,7 +491,7 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
     for (const raw of data.taskMilestones) {
       const mappedTask = taskIdMap.get(String(raw.task_id ?? ''));
       if (!mappedTask) continue;
-      const alloc = allocateOwnedId('task_milestones', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('task_milestones', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
       db.prepare(`
         INSERT INTO task_milestones (id, task_id, user_id, title, status, target_date)
@@ -437,7 +508,7 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
 
     for (const raw of data.koreWorkspaces) {
       const oldId = typeof raw.id === 'string' ? raw.id : '';
-      const alloc = allocateOwnedId('kore_workspaces', 'user_id', oldId || undefined);
+      const alloc = allocateOwnedId('kore_workspaces', oldId || undefined);
       if (oldId) koreWsIdMap.set(oldId, alloc.id);
       if (alloc.alreadyOwned) continue;
       const oldProj = typeof raw.project_id === 'string' ? raw.project_id : '';
@@ -479,7 +550,7 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
     }
 
     for (const raw of data.researchReports) {
-      const alloc = allocateOwnedId('research_reports', 'user_id', typeof raw.id === 'string' ? raw.id : undefined);
+      const alloc = allocateOwnedId('research_reports', typeof raw.id === 'string' ? raw.id : undefined);
       if (alloc.alreadyOwned) continue;
       const oldProj = typeof raw.project_id === 'string' ? raw.project_id : '';
       const mappedProj = oldProj ? projectIdMap.get(oldProj) ?? null : null;
@@ -502,6 +573,18 @@ settingsRouter.post('/restore', requireAuth, restoreLimiter, (req: Authenticated
   });
 
   runRestore();
+
+  for (const item of ragToIndex) {
+    await indexKnowledgeSource({
+      userId,
+      sourceType: item.sourceType,
+      sourceId: item.sourceId,
+      projectId: item.projectId,
+      title: item.title,
+      text: item.text,
+      computeEmbeddings: false,
+    });
+  }
 
   recordAuditLog({
     actorUserId: userId,

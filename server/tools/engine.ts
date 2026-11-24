@@ -233,14 +233,26 @@ export async function runBuiltinToolById(params: ToolRunParams): Promise<ToolRun
         if (!ai) {
           throw new Error('GEMINI_API_KEY not configured on server for live web search grounding.');
         }
-        const resp = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Search the web and summarize verifiable facts for: ${query}`,
-          config: {
-            tools: [{ googleSearch: {} }],
-            abortSignal: AbortSignal.timeout(15_000),
-          },
-        });
+        let resp: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+        let lastSearchErr: unknown = null;
+        for (const searchModel of ['gemini-3.1-flash-lite', 'gemini-3.6-flash']) {
+          try {
+            resp = await ai.models.generateContent({
+              model: searchModel,
+              contents: `Search the web and summarize verifiable facts for: ${query}`,
+              config: {
+                tools: [{ googleSearch: {} }],
+                abortSignal: AbortSignal.timeout(15_000),
+              },
+            });
+            break;
+          } catch (err) {
+            lastSearchErr = err;
+          }
+        }
+        if (!resp) {
+          throw lastSearchErr instanceof Error ? lastSearchErr : new Error('Live web search failed.');
+        }
         const chunks = resp.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
         const sources = chunks
           .map((c: { web?: { uri?: string; title?: string } }) => ({

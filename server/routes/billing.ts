@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { COMMERCIAL_PLANS, DEFAULT_PLAN_LIMITS, MAX_CONFIGURABLE_DAILY_TOKENS } from '../../src/shared/quotas';
 import { db, recordAuditLog } from '../db';
-import { type AuthenticatedRequest, getUserQuotaUsage, requireAuth } from '../middleware';
+import { type AuthenticatedRequest, getDetailedUserQuota, requireAuth } from '../middleware';
 
 export const billingRouter = Router();
 
@@ -9,7 +9,7 @@ billingRouter.use(requireAuth);
 
 billingRouter.get('/summary', (req: AuthenticatedRequest, res) => {
   const user = req.authUser!;
-  const quota = getUserQuotaUsage(user.id);
+  const quota = getDetailedUserQuota(user);
 
   const agg = db
     .prepare(`
@@ -65,11 +65,11 @@ billingRouter.get('/summary', (req: AuthenticatedRequest, res) => {
       {
         id: 'free',
         name: 'Free',
-        audience: 'For personal exploration and fast everyday chat',
+        audience: 'Full 5-model chat, vision, documents & studio workflows included',
         priceDisplay: '$0 / month',
         dailyLimit: DEFAULT_PLAN_LIMITS.free.daily,
         monthlyLimit: DEFAULT_PLAN_LIMITS.free.monthly,
-        models: ['Sonic 3', 'Sonic 3.5', 'LOODY Vision 1 (Preview)'],
+        models: ['Sonic 3', 'Sonic 3.5', 'LOODY 5.5', 'Fables 5.3', 'LOODY Vision 1'],
       },
       {
         id: 'premium',
@@ -78,7 +78,11 @@ billingRouter.get('/summary', (req: AuthenticatedRequest, res) => {
         priceDisplay: '$15 - $40 / month (billing disabled)',
         dailyLimit: DEFAULT_PLAN_LIMITS.premium.daily,
         monthlyLimit: DEFAULT_PLAN_LIMITS.premium.monthly,
-        models: ['All Free Models', 'Lodie 5.5', 'Fables 5.3'],
+        models: [
+          'All 5 LOODY Models (Extended Quotas)',
+          'Extended Per-Model Daily Caps',
+          'Priority Multimodal & Research Budgets',
+        ],
       },
       {
         id: 'developer',
@@ -94,8 +98,13 @@ billingRouter.get('/summary', (req: AuthenticatedRequest, res) => {
     usage: {
       dailyUsed: quota.dailyUsed,
       dailyLimit: user.dailyTokenLimit,
+      dailyRemaining: quota.dailyRemaining,
       monthlyUsed: quota.monthlyUsed,
       monthlyLimit: user.monthlyTokenLimit,
+      monthlyRemaining: quota.monthlyRemaining,
+      dailyResetAtUtc: quota.dailyResetAtUtc,
+      monthlyResetAtUtc: quota.monthlyResetAtUtc,
+      perModelDaily: quota.perModelDaily,
       providerReportedTotal: Number(agg.provider_reported_total ?? 0),
       estimatedTotal: Number(agg.estimated_total ?? 0),
       estimatedCostUsd: Number((agg.total_cost_usd ?? 0).toFixed(6)),

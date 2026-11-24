@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
+import { buildUnifiedSystemInstruction, wrapUntrustedContext } from '../../src/shared/assistantPolicy';
 import { buildDagExecutionBatches } from '../../src/shared/orchestrator';
 import { computeEstimatedCostUsd, reconcileTokenRecord } from '../../src/shared/quotas';
 import type { AgentProfile, AgentStepRecord, OrchestratorMode, SpecialistAgentId } from '../../src/shared/types';
@@ -239,7 +240,9 @@ async function executeRunPipeline(runId: string, userId: string, userEmail: stri
           const depOutputs = steps
             .filter((s) => step.dependsOn.includes(s.id))
             .map((d) => {
-              const latest = db.prepare('SELECT output_text FROM agent_steps WHERE id = ?').get(d.id) as
+              const latest = db
+                .prepare('SELECT output_text FROM agent_steps WHERE id = ? AND run_id = ? AND user_id = ?')
+                .get(d.id, runId, userId) as
                 | { output_text: string }
                 | undefined;
               return `--- Prior Step (${d.title}) ---\n${latest?.output_text ?? ''}`;
@@ -264,7 +267,12 @@ async function executeRunPipeline(runId: string, userId: string, userEmail: stri
             });
             toolNotes.push(
               toolRes.ok
-                ? `Tool ${toolId} output: ${JSON.stringify(toolRes.output).slice(0, 2500)}`
+                ? wrapUntrustedContext({
+                    kind: 'tool_output',
+                    name: toolId,
+                    content: JSON.stringify(toolRes.output),
+                    maxChars: 2500,
+                  })
                 : `Tool ${toolId} note: ${toolRes.error ?? 'Approval needed'}`
             );
           }
@@ -276,10 +284,17 @@ async function executeRunPipeline(runId: string, userId: string, userEmail: stri
           const stepTimer = setTimeout(() => stepAbortController.abort(new Error('Agent step timed out after 45s')), STEP_TIMEOUT_MS);
           try {
             const gen = await generateModelText({
-              upstreamModelId: 'gemini-4-hydrogen',
+              upstreamModelId: 'gemini-3.1-flash-lite',
               thinkingPreset: 'MEDIUM',
               signal: stepAbortController.signal,
-              systemInstruction: `You are ${profile.name} (${profile.roleTitle}) inside LOODY Multi-Agent Orchestrator. Stay strictly grounded in provided context and tool outputs. Never fabricate executed tests or unverified URLs.`,
+              systemInstruction: buildUnifiedSystemInstruction({
+                surface: 'agent',
+                modelId: 'sonic-3.5',
+                modelDisplayName: 'Sonic 3.5',
+                upstreamProvider: 'gemini',
+                upstreamModelId: 'gemini-3.1-flash-lite',
+                surfaceInstruction: `Specialist role: ${profile.name} (${profile.roleTitle}). Stay strictly grounded in provided dependency outputs and verified tool outputs.`,
+              }),
               prompt: `Overall Goal:\n${goal}\n\nAssigned Role Step: ${step.title}\n\n${
                 toolNotes.length > 0 ? `Tool Execution Results:\n${toolNotes.join('\n')}\n\n` : ''
               }${depOutputs ? `Shared Task State from Dependencies:\n${depOutputs}\n\n` : ''}Produce a structured, concrete output for this step.`,
@@ -557,51 +572,61 @@ agentsRouter.post('/runs/:id/approve-step/:stepId', async (req: AuthenticatedReq
     return;
   }
 
+  const userId = req.authUser!.id;
   if (decision.data === 'rejected') {
-    db.prepare("UPDATE agent_steps SET status = 'cancelled', approval_status = 'rejected' WHERE id = ?").run(
-      req.params.stepId
+    db.prepare("UPDATE agent_steps SET status = 'cancelled', approval_status = 'rejected' WHERE id = ? AND user_id = ?").run(
+      req.params.stepId,
+      userId
     );
-    db.prepare("UPDATE agent_runs SET status = 'cancelled', updated_at = ? WHERE id = ?").run(
+    db.prepare("UPDATE agent_runs SET status = 'cancelled', updated_at = ? WHERE id = ? AND user_id = ?").run(
       new Date().toISOString(),
-      req.params.id
+      req.params.id,
+      userId
     );
   } else {
-    db.prepare("UPDATE agent_steps SET status = 'pending', approval_status = 'approved' WHERE id = ?").run(
-      req.params.stepId
+    db.prepare("UPDATE agent_steps SET status = 'pending', approval_status = 'approved' WHERE id = ? AND user_id = ?").run(
+      req.params.stepId,
+      userId
     );
-    await executeRunPipeline(String(req.params.id), req.authUser!.id, req.authUser!.email);
+    await executeRunPipeline(String(req.params.id), userId, req.authUser!.email);
   }
 
   const updated = db
     .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.authUser!.id) as Record<string, unknown>;
+    .get(req.params.id, userId) as Record<string, unknown>;
   res.json({ run: hydrateRun(updated) });
 });
 
 agentsRouter.post('/runs/:id/cancel', (req: AuthenticatedRequest, res) => {
+  const userId = req.authUser!.id;
   const row = db
     .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
+    .get(req.params.id, userId) as Record<string, unknown> | undefined;
   if (!row) {
     res.status(404).json({ error: 'Agent run not found.' });
     return;
   }
   activeRunControllers.get(String(req.params.id))?.abort();
-  db.prepare("UPDATE agent_runs SET status = 'cancelled', updated_at = ? WHERE id = ?").run(
+  db.prepare("UPDATE agent_runs SET status = 'cancelled', updated_at = ? WHERE id = ? AND user_id = ?").run(
     new Date().toISOString(),
-    req.params.id
+    req.params.id,
+    userId
   );
-  db.prepare("UPDATE agent_steps SET status = 'cancelled' WHERE run_id = ? AND status IN ('pending', 'running', 'awaiting_approval')").run(
-    req.params.id
+  db.prepare("UPDATE agent_steps SET status = 'cancelled' WHERE run_id = ? AND user_id = ? AND status IN ('pending', 'running', 'awaiting_approval')").run(
+    req.params.id,
+    userId
   );
-  const updated = db.prepare('SELECT * FROM agent_runs WHERE id = ?').get(req.params.id) as Record<string, unknown>;
+  const updated = db
+    .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
+    .get(req.params.id, userId) as Record<string, unknown>;
   res.json({ run: hydrateRun(updated) });
 });
 
 agentsRouter.post('/runs/:id/pause', (req: AuthenticatedRequest, res) => {
+  const userId = req.authUser!.id;
   const row = db
     .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
+    .get(req.params.id, userId) as Record<string, unknown> | undefined;
   if (!row) {
     res.status(404).json({ error: 'Agent run not found.' });
     return;
@@ -611,20 +636,27 @@ agentsRouter.post('/runs/:id/pause', (req: AuthenticatedRequest, res) => {
     res.status(400).json({ error: `Cannot pause an agent run in "${status}" state.` });
     return;
   }
-  db.prepare("UPDATE agent_runs SET status = 'paused', updated_at = ? WHERE id = ?").run(
+  db.prepare("UPDATE agent_runs SET status = 'paused', updated_at = ? WHERE id = ? AND user_id = ?").run(
     new Date().toISOString(),
-    req.params.id
+    req.params.id,
+    userId
   );
-  db.prepare("UPDATE agent_steps SET status = 'pending' WHERE run_id = ? AND status = 'running'").run(req.params.id);
+  db.prepare("UPDATE agent_steps SET status = 'pending' WHERE run_id = ? AND user_id = ? AND status = 'running'").run(
+    req.params.id,
+    userId
+  );
   activeRunControllers.get(String(req.params.id))?.abort();
-  const updated = db.prepare('SELECT * FROM agent_runs WHERE id = ?').get(req.params.id) as Record<string, unknown>;
+  const updated = db
+    .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
+    .get(req.params.id, userId) as Record<string, unknown>;
   res.json({ run: hydrateRun(updated) });
 });
 
 agentsRouter.post('/runs/:id/resume', async (req: AuthenticatedRequest, res) => {
+  const userId = req.authUser!.id;
   const row = db
     .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.authUser!.id) as Record<string, unknown> | undefined;
+    .get(req.params.id, userId) as Record<string, unknown> | undefined;
   if (!row) {
     res.status(404).json({ error: 'Agent run not found.' });
     return;
@@ -634,13 +666,14 @@ agentsRouter.post('/runs/:id/resume', async (req: AuthenticatedRequest, res) => 
     res.status(400).json({ error: `Only paused or failed runs can be resumed (current: ${status}).` });
     return;
   }
-  db.prepare("UPDATE agent_steps SET status = 'pending', error_message = NULL WHERE run_id = ? AND status = 'failed'").run(
-    req.params.id
+  db.prepare("UPDATE agent_steps SET status = 'pending', error_message = NULL WHERE run_id = ? AND user_id = ? AND status = 'failed'").run(
+    req.params.id,
+    userId
   );
-  await executeRunPipeline(String(req.params.id), req.authUser!.id, req.authUser!.email);
+  await executeRunPipeline(String(req.params.id), userId, req.authUser!.email);
   const updated = db
     .prepare('SELECT * FROM agent_runs WHERE id = ? AND user_id = ?')
-    .get(req.params.id, req.authUser!.id) as Record<string, unknown>;
+    .get(req.params.id, userId) as Record<string, unknown>;
   res.json({ run: hydrateRun(updated) });
 });
 

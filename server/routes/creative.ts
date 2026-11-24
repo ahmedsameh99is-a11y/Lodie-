@@ -5,6 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { Router } from 'express';
 import { z } from 'zod';
+import { buildUnifiedSystemInstruction } from '../../src/shared/assistantPolicy';
 import { arrangeImagesOnVoiceoverTimeline } from '../../src/shared/orchestrator';
 import { computeEstimatedCostUsd, reconcileTokenRecord } from '../../src/shared/quotas';
 import type { VideoTimelineClip } from '../../src/shared/types';
@@ -547,9 +548,16 @@ creativeRouter.post('/generate-brief', briefLimiter, async (req: AuthenticatedRe
 
   try {
     const gen = await generateModelText({
-      upstreamModelId: 'gemini-4-hydrogen',
+      upstreamModelId: 'gemini-3.1-flash-lite',
       thinkingPreset: 'MEDIUM',
-      systemInstruction: instructions[parsed.data.mode],
+      systemInstruction: buildUnifiedSystemInstruction({
+        surface: 'creative',
+        modelId: 'sonic-3.5',
+        modelDisplayName: 'Sonic 3.5',
+        upstreamProvider: 'gemini',
+        upstreamModelId: 'gemini-3.1-flash-lite',
+        surfaceInstruction: instructions[parsed.data.mode],
+      }),
       prompt: parsed.data.brief,
     });
     const reconciled = reconcileTokenRecord({

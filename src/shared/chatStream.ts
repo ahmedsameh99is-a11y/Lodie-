@@ -1,4 +1,10 @@
-import type { ChatMessage, ErrorClass, KnowledgeCitation, OrchestratorMode } from './types';
+import type {
+  ChatMessage,
+  ErrorClass,
+  KnowledgeCitation,
+  OrchestratorMode,
+  PerModelDailyQuotaEntry,
+} from './types';
 
 export interface ChatStreamMetaEvent {
   conversationId: string;
@@ -9,6 +15,7 @@ export interface ChatStreamMetaEvent {
   fallbackFromModelId?: string;
   fallbackReason?: string;
   fallbackErrorClass?: ErrorClass;
+  fallbackNotice?: string;
   citations?: KnowledgeCitation[];
 }
 
@@ -19,7 +26,18 @@ export interface ChatStreamDoneEvent {
   fallbackUsed?: string;
   aborted?: boolean;
   citations?: KnowledgeCitation[];
-  quota?: { dailyUsed: number; monthlyUsed: number };
+  quota?: {
+    dailyUsed: number;
+    dailyLimit?: number;
+    dailyRemaining?: number;
+    monthlyUsed: number;
+    monthlyLimit?: number;
+    monthlyRemaining?: number;
+    dailyResetAtUtc?: string;
+    monthlyResetAtUtc?: string;
+    perModelDaily?: PerModelDailyQuotaEntry[];
+  };
+  timingsMs?: Record<string, number>;
 }
 
 export interface ChatStreamErrorEventMeta {

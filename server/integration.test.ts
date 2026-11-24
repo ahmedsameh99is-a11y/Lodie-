@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import test, { after, before } from 'node:test';
-import { createApiApp } from './app';
-import { db } from './db';
+import type Database from 'better-sqlite3';
 
+let db: Database.Database;
+let tempDbPath = '';
 let server: http.Server;
 let baseUrl = '';
 const createdUserIds: string[] = [];
@@ -36,6 +40,12 @@ let userBCookie = '';
 let userBId = '';
 
 before(async () => {
+  tempDbPath = path.join(os.tmpdir(), `loody-integration-${process.pid}-${Date.now()}.db`);
+  process.env.LOODY_DB_PATH = tempDbPath;
+  const { createApiApp } = await import('./app');
+  const dbMod = await import('./db');
+  db = dbMod.db;
+
   const app = createApiApp();
   await new Promise<void>((resolve) => {
     server = app.listen(0, '127.0.0.1', () => resolve());
@@ -78,6 +88,10 @@ after(async () => {
     db.prepare('DELETE FROM users WHERE id = ?').run(uid);
   }
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  db.close();
+  for (const ext of ['', '-wal', '-shm']) {
+    fs.rmSync(`${tempDbPath}${ext}`, { force: true });
+  }
 });
 
 test('Auth session validation & invalid password rejection', async () => {

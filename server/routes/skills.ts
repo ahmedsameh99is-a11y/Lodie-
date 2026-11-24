@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
+import { buildUnifiedSystemInstruction, wrapUntrustedContext } from '../../src/shared/assistantPolicy';
 import { validateSkillDefinition } from '../../src/shared/orchestrator';
 import { computeEstimatedCostUsd, reconcileTokenRecord } from '../../src/shared/quotas';
 import { db, recordAuditLog } from '../db';
@@ -122,6 +123,10 @@ skillsRouter.patch('/:id', (req: AuthenticatedRequest, res) => {
     return;
   }
   const isBuiltin = Boolean(row.is_builtin);
+  if (isBuiltin && req.authUser!.role !== 'developer' && req.authUser!.role !== 'admin') {
+    res.status(403).json({ error: 'Developer role required to modify built-in skills.' });
+    return;
+  }
   if (!isBuiltin && row.owner_user_id !== req.authUser!.id) {
     res.status(403).json({ error: 'Not authorized to modify this skill.' });
     return;
@@ -262,14 +267,26 @@ skillsRouter.post('/:id/execute', skillExecuteLimiter, async (req: Authenticated
   const prompt = skill.promptTemplate.replace('{{input}}', inputPayload.slice(0, 12000));
   const toolSection =
     toolOutputs.length > 0
-      ? `\n\nDeclared Skill Tool Results:\n${JSON.stringify(toolOutputs, null, 2).slice(0, 5000)}`
+      ? `\n\nDeclared Skill Tool Results:\n${wrapUntrustedContext({
+          kind: 'tool_output',
+          name: `skill:${skill.id}`,
+          content: JSON.stringify(toolOutputs, null, 2),
+          maxChars: 5000,
+        })}`
       : '';
 
   try {
     const gen = await generateModelText({
-      upstreamModelId: 'gemini-4-hydrogen',
+      upstreamModelId: 'gemini-3.1-flash-lite',
       thinkingPreset: 'MEDIUM',
-      systemInstruction: `You are executing the LOODY Skill "${skill.name}" (v${skill.version}, category: ${skill.category}). Follow the skill template strictly.`,
+      systemInstruction: buildUnifiedSystemInstruction({
+        surface: 'skill',
+        modelId: 'sonic-3.5',
+        modelDisplayName: 'Sonic 3.5',
+        upstreamProvider: 'gemini',
+        upstreamModelId: 'gemini-3.1-flash-lite',
+        surfaceInstruction: `Executing LOODY Skill "${skill.name}" (v${skill.version}, category: ${skill.category}). Follow the skill template strictly.`,
+      }),
       prompt: `${prompt}${toolSection}`,
     });
 

@@ -21,7 +21,7 @@ import { LoodyLogo } from './LoodyLogo';
 
 interface HomeViewProps {
   user: PublicUser | null;
-  usage: { dailyUsed: number; monthlyUsed: number };
+  usage: { dailyUsed: number; monthlyUsed: number; dailyRemaining?: number; dailyResetAtUtc?: string };
   models: BrandedModel[];
   activeModelId: string;
   conversations: Conversation[];
@@ -53,6 +53,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
   const dailyLimit = user?.dailyTokenLimit ?? 150_000;
   const dailyPct = Math.min(100, Math.round((usage.dailyUsed / Math.max(1, dailyLimit)) * 100));
+  const dailyRemaining = usage.dailyRemaining ?? Math.max(0, dailyLimit - usage.dailyUsed);
 
   return (
     <div className="mx-auto max-w-6xl px-4 sm:px-6 py-6 sm:py-8 space-y-8">
@@ -125,6 +126,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
             </div>
             <div className="mt-1.5 h-1.5 w-full rounded-full bg-zinc-200 dark:bg-white/10 overflow-hidden">
               <div className="h-full bg-emerald-500" style={{ width: `${dailyPct}%` }} />
+            </div>
+            <div className="mt-1 text-[10px] font-mono text-zinc-500 tabular-nums">
+              {dailyRemaining.toLocaleString()} left
             </div>
           </div>
 

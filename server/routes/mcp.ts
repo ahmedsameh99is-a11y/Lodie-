@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { McpToolSchema } from '../../src/shared/types';
 import { db, listBuiltinTools, recordAuditLog } from '../db';
-import { type AuthenticatedRequest, requireAuth } from '../middleware';
+import { type AuthenticatedRequest, requireAuth, requireDeveloper } from '../middleware';
 import {
   assertSafeExternalUrl,
   createRateLimiter,
@@ -583,7 +583,7 @@ mcpRouter.get('/builtin-tools', (_req, res) => {
   res.json({ tools: listBuiltinTools() });
 });
 
-mcpRouter.patch('/builtin-tools/:id', (req: AuthenticatedRequest, res) => {
+mcpRouter.patch('/builtin-tools/:id', requireDeveloper, (req: AuthenticatedRequest, res) => {
   const enabled = z.boolean().safeParse(req.body?.enabled);
   if (!enabled.success) {
     res.status(400).json({ error: 'Boolean enabled state required.' });

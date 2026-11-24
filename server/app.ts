@@ -1,5 +1,5 @@
 import express from 'express';
-import { attachAuth } from './middleware';
+import { attachAuth, csrfOriginCheck } from './middleware';
 import { agentsRouter } from './routes/agents';
 import { authRouter } from './routes/auth';
 import { billingRouter } from './routes/billing';
@@ -30,6 +30,7 @@ export function createApiApp(): express.Express {
   });
 
   app.use(express.json({ limit: '18mb' }));
+  app.use('/api', csrfOriginCheck);
   app.use(attachAuth);
 
   // Health & Version check

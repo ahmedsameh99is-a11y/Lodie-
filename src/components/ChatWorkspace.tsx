@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -32,11 +32,12 @@ import {
   VolumeX,
   BookOpen,
 } from 'lucide-react';
-import { api, streamChat } from '../lib/api';
+import { ApiError, api, streamChat } from '../lib/api';
 import { buildConversationJson, buildConversationMarkdown, triggerBrowserDownload } from '../shared/chatExport';
 import { reconcileStreamMessages } from '../shared/chatStream';
 import { t } from '../shared/i18n';
 import { getModelStatusMeta } from '../shared/modelRegistry';
+import { canAccessModel } from '../shared/quotas';
 import type {
   AppLanguage,
   BrandedModel,
@@ -52,6 +53,277 @@ import type {
 } from '../shared/types';
 import { InlineMarkdownErrorBoundary } from './ErrorBoundary';
 import { LoodyLogo } from './LoodyLogo';
+
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_PLUGINS = [rehypeKatex, rehypeHighlight];
+
+function extractNodeText(node: React.ReactNode): string {
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(extractNodeText).join('');
+  if (React.isValidElement<{ children?: React.ReactNode }>(node)) {
+    return extractNodeText(node.props.children);
+  }
+  return '';
+}
+
+const CodeBlock: React.FC<{ children?: React.ReactNode }> = ({ children }) => {
+  const [copied, setCopied] = useState(false);
+  const codeStr = extractNodeText(children);
+
+  return (
+    <div className="my-3 overflow-hidden rounded-xl border border-zinc-200 dark:border-emerald-500/20 bg-zinc-50 dark:bg-[#050706]">
+      <div className="flex items-center justify-between border-b border-zinc-200 dark:border-white/10 bg-zinc-100/80 dark:bg-[#0A0E0C] px-3 py-1.5 text-[11px] text-zinc-500">
+        <span className="font-mono">code</span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              navigator.clipboard.writeText(codeStr).catch(() => null);
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1500);
+            }}
+            className="inline-flex items-center gap-1 hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer"
+          >
+            {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+            <span>{copied ? 'Copied' : 'Copy'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => triggerBrowserDownload('snippet.txt', codeStr, 'text/plain;charset=utf-8')}
+            className="inline-flex items-center gap-1 hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer"
+          >
+            <Download className="w-3 h-3" />
+            <span>Download</span>
+          </button>
+        </div>
+      </div>
+      <pre className="overflow-x-auto p-3.5 text-xs font-mono leading-relaxed">{children}</pre>
+    </div>
+  );
+};
+
+interface MemoMessageBubbleProps {
+  message: ChatMessage;
+  language: AppLanguage;
+  authorLabel: string;
+  isLastAssistant: boolean;
+  isCopied: boolean;
+  isSpeaking: boolean;
+  isExpanded: boolean;
+  isEditing: boolean;
+  editingText: string;
+  isCitationOpen: boolean;
+  streaming: boolean;
+  markdownComponents: Components;
+  onCopy: (id: string, text: string) => void;
+  onToggleSpeak: (id: string, text: string) => void;
+  onToggleExpand: (id: string, nextExpanded: boolean) => void;
+  onToggleCitation: (id: string) => void;
+  onStartEdit: (id: string, content: string) => void;
+  onChangeEditingText: (val: string) => void;
+  onSaveEdit: (id: string) => void;
+  onCancelEdit: () => void;
+  onRegenerate: () => void;
+  onContinue: () => void;
+}
+
+const MemoMessageBubble = React.memo<MemoMessageBubbleProps>(
+  ({
+    message: m,
+    language,
+    authorLabel,
+    isLastAssistant,
+    isCopied,
+    isSpeaking,
+    isExpanded,
+    isEditing,
+    editingText,
+    isCitationOpen,
+    streaming,
+    markdownComponents,
+    onCopy,
+    onToggleSpeak,
+    onToggleExpand,
+    onToggleCitation,
+    onStartEdit,
+    onChangeEditingText,
+    onSaveEdit,
+    onCancelEdit,
+    onRegenerate,
+    onContinue,
+  }) => {
+    const isLong = m.content.length > 2200;
+    const displayBody = isLong && !isExpanded ? `${m.content.slice(0, 1200)}...` : m.content;
+
+    return (
+      <article
+        className={`rounded-2xl p-4 sm:p-5 ${
+          m.role === 'user'
+            ? 'bg-emerald-50/70 dark:bg-[#0F1713] border border-emerald-500/25 ms-auto max-w-[92%] sm:max-w-[82%]'
+            : 'bg-white dark:bg-[#0A0E0C] border border-zinc-200 dark:border-white/8'
+        }`}
+      >
+        <div className="mb-2 flex items-center justify-between gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+          <span className="font-semibold text-zinc-800 dark:text-zinc-200">{authorLabel}</span>
+          {m.role === 'assistant' && typeof m.outputTokens === 'number' && (
+            <span className="font-mono tabular-nums text-[11px] text-zinc-400">
+              {m.inputTokens} in · {m.outputTokens} out ·{' '}
+              {m.tokenAccountingType === 'provider_reported' ? 'Exact' : 'Est.'}
+            </span>
+          )}
+        </div>
+
+        {m.attachments && m.attachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {m.attachments.map((att, aIdx) => (
+              <span
+                key={aIdx}
+                className="rounded-lg border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#050706] px-2 py-1 text-[11px] text-zinc-600 dark:text-zinc-300"
+              >
+                {att.name}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {isEditing ? (
+          <div className="space-y-2">
+            <textarea
+              value={editingText}
+              onChange={(e) => onChangeEditingText(e.target.value)}
+              rows={3}
+              className="w-full rounded-xl border border-emerald-500/40 bg-white dark:bg-[#050706] p-3 text-sm text-zinc-900 dark:text-white focus:outline-none"
+            />
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => onSaveEdit(m.id)}
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 min-h-[36px] cursor-pointer"
+              >
+                {t(language, 'saveAndResend')}
+              </button>
+              <button
+                type="button"
+                onClick={onCancelEdit}
+                className="rounded-lg border border-zinc-300 dark:border-white/10 px-3 py-1.5 text-xs text-zinc-600 dark:text-zinc-300 min-h-[36px] cursor-pointer"
+              >
+                {t(language, 'cancel')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="prose prose-zinc dark:prose-invert prose-sm max-w-none prose-code:text-emerald-700 dark:prose-code:text-emerald-300">
+            <InlineMarkdownErrorBoundary fallbackText={displayBody} resetKey={displayBody}>
+              <ReactMarkdown
+                remarkPlugins={REMARK_PLUGINS}
+                rehypePlugins={REHYPE_PLUGINS}
+                components={markdownComponents}
+              >
+                {displayBody}
+              </ReactMarkdown>
+            </InlineMarkdownErrorBoundary>
+          </div>
+        )}
+
+        {isLong && (
+          <button
+            type="button"
+            onClick={() => onToggleExpand(m.id, !isExpanded)}
+            className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400 cursor-pointer"
+          >
+            <ChevronRight className={`w-3.5 h-3.5 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+            <span>{isExpanded ? 'Collapse long response' : 'Expand full response'}</span>
+          </button>
+        )}
+
+        {m.role === 'assistant' && m.citations && m.citations.length > 0 && (
+          <div className="mt-3 rounded-xl border border-emerald-500/20 bg-zinc-50 dark:bg-[#050706] p-3 text-xs space-y-2">
+            <button
+              type="button"
+              onClick={() => onToggleCitation(m.id)}
+              className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-300 cursor-pointer"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span>
+                {m.citations.length} Knowledge Source{m.citations.length === 1 ? '' : 's'} Cited
+              </span>
+            </button>
+            {isCitationOpen && (
+              <div className="space-y-1.5 pt-1 border-t border-zinc-200 dark:border-white/10">
+                {m.citations.map((c) => (
+                  <div key={c.chunkId} className="rounded-lg bg-white dark:bg-[#0D110F] p-2 border border-zinc-200 dark:border-white/5">
+                    <div className="flex items-center justify-between text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
+                      <span>{c.title}</span>
+                      <span>{c.retrievalMethod} · {c.score.toFixed(2)}</span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-400 line-clamp-2">{c.snippet}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-wrap items-center gap-2 pt-2 border-t border-zinc-100 dark:border-white/5">
+          <button
+            type="button"
+            onClick={() => onCopy(m.id, m.content)}
+            className="inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white px-2 py-1 rounded hover:bg-zinc-100 dark:hover:bg-white/5 cursor-pointer"
+          >
+            {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{isCopied ? t(language, 'copied') : t(language, 'copy')}</span>
+          </button>
+
+          {m.role === 'assistant' && (
+            <button
+              type="button"
+              onClick={() => onToggleSpeak(m.id, m.content)}
+              className={`inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded cursor-pointer ${
+                isSpeaking
+                  ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                  : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white hover:bg-zinc-100 dark:hover:bg-white/5'
+              }`}
+            >
+              {isSpeaking ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+              <span>{isSpeaking ? t(language, 'stopSpeaking') : t(language, 'readAloud')}</span>
+            </button>
+          )}
+
+          {m.role === 'user' && !streaming && (
+            <button
+              type="button"
+              onClick={() => onStartEdit(m.id, m.content)}
+              className="inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white px-2 py-1 rounded hover:bg-zinc-100 dark:hover:bg-white/5 cursor-pointer"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+              <span>{t(language, 'edit')}</span>
+            </button>
+          )}
+
+          {isLastAssistant && (
+            <>
+              <button
+                type="button"
+                onClick={onRegenerate}
+                className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 px-2 py-1 rounded hover:bg-emerald-500/10 cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>{t(language, 'regenerate')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={onContinue}
+                className="inline-flex items-center gap-1 text-[11px] text-zinc-600 dark:text-zinc-300 px-2 py-1 rounded hover:bg-zinc-100 dark:hover:bg-white/5 cursor-pointer"
+              >
+                <span>{t(language, 'continueResponse')}</span>
+              </button>
+            </>
+          )}
+        </div>
+      </article>
+    );
+  }
+);
 
 interface ChatWorkspaceProps {
   user: PublicUser | null;
@@ -69,6 +341,7 @@ interface ChatWorkspaceProps {
   onSelectProject: (id: string | null) => void;
   onOpenSidebar: () => void;
   onOpenModelHub: () => void;
+  onOpenUsage?: () => void;
   onOpenAuth: () => void;
   onRefreshConversations: () => Promise<void>;
   onUsageUpdate: (usage: { dailyUsed: number; monthlyUsed: number }) => void;
@@ -104,6 +377,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   onSelectProject,
   onOpenSidebar,
   onOpenModelHub,
+  onOpenUsage,
   onOpenAuth,
   onRefreshConversations,
   onUsageUpdate,
@@ -118,6 +392,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const [resolvedMode, setResolvedMode] = useState<Exclude<OrchestratorMode, 'auto'> | null>(null);
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [lastFailedRetry, setLastFailedRetry] = useState<{
     promptText: string;
     mode: 'send' | 'regenerate' | 'edit_resend' | 'continue';
@@ -166,7 +442,6 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const activeModel = models.find((m) => m.id === activeModelId) ?? models[0];
   const activeConversation = conversations.find((c) => c.id === activeConvId) ?? null;
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
-  const supportsVision = activeModel?.inputModalities.includes('image') ?? false;
 
   useEffect(() => {
     if (!user) {
@@ -253,8 +528,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   }, [activeConvId, user?.id]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length, streamingText]);
+    endRef.current?.scrollIntoView({ behavior: streaming ? 'auto' : 'smooth' });
+  }, [messages.length, streaming, streamingText]);
 
   const filteredMessages = useMemo(() => {
     const q = threadQuery.trim().toLowerCase();
@@ -265,6 +540,10 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const processIncomingFiles = async (fileList: FileList | File[]) => {
     const files = Array.from(fileList);
     for (const file of files) {
+      if (file.size === 0) {
+        setError(`File "${file.name}" is empty (0 bytes).`);
+        continue;
+      }
       if (['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) {
         if (file.size > 4_000_000) {
           setError(`Image "${file.name}" exceeds 4 MB.`);
@@ -273,26 +552,19 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         const reader = new FileReader();
         reader.onload = () => {
           const base64 = String(reader.result ?? '').split(',')[1] ?? '';
+          if (!base64) {
+            setError(`Image "${file.name}" could not be read.`);
+            return;
+          }
           setAttachments((prev) => [
             ...prev.slice(0, 2),
             { mimeType: file.type, dataBase64: base64, name: file.name, sizeBytes: file.size },
           ]);
         };
+        reader.onerror = () => {
+          setError(`Failed to read image "${file.name}".`);
+        };
         reader.readAsDataURL(file);
-        if (!supportsVision) {
-          const visionModels = models.filter((m) => m.inputModalities.includes('image'));
-          const bestVision =
-            visionModels.find((m) => m.availability === 'operational') ??
-            visionModels.find((m) => getModelStatusMeta(m).callable);
-          if (bestVision) {
-            onSelectModel(bestVision.id);
-          } else if (visionModels.length > 0) {
-            const vm = visionModels[0];
-            setError(
-              `${vm.displayName} is currently ${getModelStatusMeta(vm).badgeLabel.toLowerCase()} (${vm.availabilityReason}). Image attachments cannot route to text-only models.`
-            );
-          }
-        }
       } else if (
         file.type.startsWith('text/') ||
         file.type === 'application/json' ||
@@ -371,6 +643,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     const isCurrentRun = () => activeStreamRef.current?.runId === runId;
 
     setError(null);
+    setErrorCode(null);
+    setErrorStatus(null);
     setFallbackNotice(null);
     setLastFailedRetry(null);
     setStreaming(true);
@@ -379,12 +653,16 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const hasAttachmentsPayload = attachments.length > 0 || docAttachments.length > 0;
+    const displayUserPrompt =
+      params.promptText || (hasAttachmentsPayload ? 'Please analyze the attached file(s) and image(s).' : '');
+
     if (params.mode !== 'regenerate' && params.mode !== 'continue') {
       const tempUserMsg: ChatMessage = {
         id: `temp-${Date.now()}-${runId}`,
         conversationId: resolvedConvId ?? 'pending',
         role: 'user',
-        content: params.promptText,
+        content: displayUserPrompt,
         attachments: [
           ...attachments.map((a) => ({ mimeType: a.mimeType, name: a.name, kind: 'image' as const })),
           ...docAttachments.map((d) => ({ mimeType: d.mimeType, name: d.name, kind: 'document' as const })),
@@ -468,7 +746,9 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
           if (meta.resolvedMode) {
             setResolvedMode(meta.resolvedMode);
           }
-          if (meta.fallbackFromModelId && meta.modelId) {
+          if (meta.fallbackNotice) {
+            setFallbackNotice(String(meta.fallbackNotice));
+          } else if (meta.fallbackFromModelId && meta.modelId && meta.fallbackFromModelId !== meta.modelId) {
             const origName = models.find((x) => x.id === meta.fallbackFromModelId)?.displayName ?? meta.fallbackFromModelId;
             const nextName = models.find((x) => x.id === meta.modelId)?.displayName ?? meta.modelId;
             const detail = meta.fallbackReason
@@ -502,7 +782,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 setError('Generation was stopped before any output was produced.');
               }
             }
-            await onRefreshConversations();
+            void onRefreshConversations();
           })();
         },
         onError: (errMsg, errMeta) => {
@@ -522,15 +802,23 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 setDocAttachments([]);
               }
               setError(errMsg);
-              setLastFailedRetry({
-                promptText: params.promptText,
-                mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
-                convId: cid,
-                targetMessageId: params.targetMessageId,
-              });
+              const metaRecord = errMeta as unknown as { code?: string; status?: number } | undefined;
+              const code = typeof metaRecord?.code === 'string' ? metaRecord.code : null;
+              setErrorCode(code);
+              setErrorStatus(typeof metaRecord?.status === 'number' ? metaRecord.status : null);
+              if (code !== 'ENTITLEMENT_REQUIRED') {
+                setLastFailedRetry({
+                  promptText: params.promptText,
+                  mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
+                  convId: cid,
+                  targetMessageId: params.targetMessageId,
+                });
+              } else {
+                setLastFailedRetry(null);
+              }
             }
             if (cid) {
-              await onRefreshConversations();
+              void onRefreshConversations();
             }
           })();
         },
@@ -550,7 +838,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
             setError('Generation stopped before receiving a response.');
           }
           if (resolvedConvId) {
-            await onRefreshConversations();
+            void onRefreshConversations();
           }
         }
       } else if (isCurrentRun()) {
@@ -560,12 +848,27 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
           setDocAttachments([]);
         }
         setError(err instanceof Error ? err.message : 'Streaming interrupted.');
-        setLastFailedRetry({
-          promptText: params.promptText,
-          mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
-          convId: resolvedConvId,
-          targetMessageId: params.targetMessageId,
-        });
+        if (err instanceof ApiError) {
+          setErrorStatus(err.status);
+          setErrorCode(err.code ?? null);
+          if (err.status === 403 || err.code === 'ENTITLEMENT_REQUIRED') {
+            setLastFailedRetry(null);
+          } else {
+            setLastFailedRetry({
+              promptText: params.promptText,
+              mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
+              convId: resolvedConvId,
+              targetMessageId: params.targetMessageId,
+            });
+          }
+        } else {
+          setLastFailedRetry({
+            promptText: params.promptText,
+            mode: userMessageIdFromServer ? 'regenerate' : (params.mode ?? 'send'),
+            convId: resolvedConvId,
+            targetMessageId: params.targetMessageId,
+          });
+        }
       }
     } finally {
       if (isCurrentRun()) {
@@ -577,9 +880,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     }
   };
 
+  const hasComposerPayload = Boolean(input.trim() || attachments.length > 0 || docAttachments.length > 0);
+
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || streaming) return;
+    if ((!trimmed && attachments.length === 0 && docAttachments.length === 0) || streaming) return;
     setInput('');
     runStream({ promptText: trimmed, mode: 'send' });
   };
@@ -625,32 +930,35 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     }
   };
 
-  const handleCopy = (id: string, text: string) => {
-    navigator.clipboard.writeText(text);
+  const handleCopy = useCallback((id: string, text: string) => {
+    navigator.clipboard.writeText(text).catch(() => null);
     setCopiedId(id);
     window.setTimeout(() => setCopiedId((prev) => (prev === id ? null : prev)), 1500);
-  };
+  }, []);
 
-  const handleToggleSpeak = (msgId: string, text: string) => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      setError('Voice output (Text-to-Speech) is not supported in this browser.');
-      return;
-    }
-    const synth = window.speechSynthesis;
-    if (speakingMsgId === msgId) {
+  const handleToggleSpeak = useCallback(
+    (msgId: string, text: string) => {
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+        setError('Voice output (Text-to-Speech) is not supported in this browser.');
+        return;
+      }
+      const synth = window.speechSynthesis;
+      if (speakingMsgId === msgId) {
+        synth.cancel();
+        setSpeakingMsgId(null);
+        return;
+      }
       synth.cancel();
-      setSpeakingMsgId(null);
-      return;
-    }
-    synth.cancel();
-    const cleanText = text.replace(/```[\s\S]*?```/g, ' Code block. ').replace(/[#*`>_~]/g, ' ').trim();
-    const utter = new SpeechSynthesisUtterance(cleanText.slice(0, 3000));
-    utter.lang = language === 'ar' ? 'ar-SA' : 'en-US';
-    utter.onend = () => setSpeakingMsgId((prev) => (prev === msgId ? null : prev));
-    utter.onerror = () => setSpeakingMsgId((prev) => (prev === msgId ? null : prev));
-    setSpeakingMsgId(msgId);
-    synth.speak(utter);
-  };
+      const cleanText = text.replace(/```[\s\S]*?```/g, ' Code block. ').replace(/[#*`>_~]/g, ' ').trim();
+      const utter = new SpeechSynthesisUtterance(cleanText.slice(0, 3000));
+      utter.lang = language === 'ar' ? 'ar-SA' : 'en-US';
+      utter.onend = () => setSpeakingMsgId((prev) => (prev === msgId ? null : prev));
+      utter.onerror = () => setSpeakingMsgId((prev) => (prev === msgId ? null : prev));
+      setSpeakingMsgId(msgId);
+      synth.speak(utter);
+    },
+    [language, speakingMsgId]
+  );
 
   const handleExport = (format: 'md' | 'json') => {
     if (!messages.length) return;
@@ -685,46 +993,66 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     await onRefreshConversations();
   };
 
-  const markdownComponents = {
-    pre({ children }: { children?: React.ReactNode }) {
-      const extractText = (node: React.ReactNode): string => {
-        if (typeof node === 'string') return node;
-        if (Array.isArray(node)) return node.map(extractText).join('');
-        if (React.isValidElement<{ children?: React.ReactNode }>(node)) {
-          return extractText(node.props.children);
-        }
-        return '';
-      };
-      const codeStr = extractText(children);
-      const codeId = `code-${codeStr.slice(0, 24)}-${codeStr.length}`;
-      return (
-        <div className="my-3 overflow-hidden rounded-xl border border-zinc-200 dark:border-emerald-500/20 bg-zinc-50 dark:bg-[#050706]">
-          <div className="flex items-center justify-between border-b border-zinc-200 dark:border-white/10 bg-zinc-100/80 dark:bg-[#0A0E0C] px-3 py-1.5 text-[11px] text-zinc-500">
-            <span className="font-mono">code</span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleCopy(codeId, codeStr)}
-                className="inline-flex items-center gap-1 hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer"
-              >
-                {copiedId === codeId ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                <span>{copiedId === codeId ? 'Copied' : 'Copy'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => triggerBrowserDownload('snippet.txt', codeStr, 'text/plain;charset=utf-8')}
-                className="inline-flex items-center gap-1 hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer"
-              >
-                <Download className="w-3 h-3" />
-                <span>Download</span>
-              </button>
-            </div>
-          </div>
-          <pre className="overflow-x-auto p-3.5 text-xs font-mono leading-relaxed">{children}</pre>
-        </div>
-      );
+  const markdownComponents = useMemo<Components>(
+    () => ({
+      pre({ children }: { children?: React.ReactNode }) {
+        return <CodeBlock>{children}</CodeBlock>;
+      },
+    }),
+    []
+  );
+
+  const handleToggleExpandMsg = useCallback((id: string, nextExpanded: boolean) => {
+    setExpandedMsgs((prev) => ({ ...prev, [id]: nextExpanded }));
+  }, []);
+
+  const handleToggleCitationMsg = useCallback((id: string) => {
+    setOpenCitationMsgId((prev) => (prev === id ? null : id));
+  }, []);
+
+  const handleStartEditMsg = useCallback((id: string, content: string) => {
+    setEditingMsgId(id);
+    setEditingText(content);
+  }, []);
+
+  const handleCancelEditMsg = useCallback(() => {
+    setEditingMsgId(null);
+  }, []);
+
+  const handleSaveEditMsg = useCallback(
+    (id: string) => {
+      const next = editingText.trim();
+      setEditingMsgId(null);
+      if (next && activeConvIdRef.current) {
+        runStream({
+          promptText: next,
+          mode: 'edit_resend',
+          targetMessageId: id,
+          convId: activeConvIdRef.current,
+        });
+      }
     },
-  };
+    [editingText]
+  );
+
+  const handleRegenerateLast = useCallback(() => {
+    const lastUser = [...messagesRef.current].reverse().find((x) => x.role === 'user');
+    if (lastUser && activeConvIdRef.current) {
+      runStream({ promptText: lastUser.content, mode: 'regenerate', convId: activeConvIdRef.current });
+    }
+  }, []);
+
+  const handleContinueLast = useCallback(() => {
+    if (activeConvIdRef.current) {
+      runStream({
+        promptText: 'Continue',
+        mode: 'continue',
+        convId: activeConvIdRef.current,
+      });
+    }
+  }, []);
+
+  const modelNameById = useMemo(() => new Map(models.map((x) => [x.id, x.displayName])), [models]);
 
   return (
     <div
@@ -745,39 +1073,48 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
       {/* Main Chat Column */}
       <div className="flex flex-1 flex-col h-full min-w-0 bg-[#F8FAF9] dark:bg-[#050706]">
         {/* Chat Sub-Toolbar */}
-        <div className="flex items-center justify-between gap-2 border-b border-zinc-200 dark:border-white/8 bg-white/95 dark:bg-[#080B09]/95 px-3 sm:px-5 py-2">
-          <div className="flex items-center gap-2 min-w-0">
+        <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 border-b border-zinc-200 dark:border-white/8 bg-white/95 dark:bg-[#080B09]/95 px-3 sm:px-5 py-2">
+          <div className="flex flex-1 items-center gap-1.5 sm:gap-2 min-w-0">
             <button
               type="button"
               onClick={onOpenSidebar}
               aria-label="Open workspace sidebar"
-              className="lg:hidden flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#0D110F] text-zinc-700 dark:text-zinc-200 cursor-pointer"
+              className="lg:hidden flex h-9 w-9 sm:h-10 sm:w-10 shrink-0 items-center justify-center rounded-lg border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#0D110F] text-zinc-700 dark:text-zinc-200 cursor-pointer"
             >
               <Menu className="w-4 h-4" />
             </button>
 
             {/* Quick Inline Model Selector */}
-            <div className="relative flex items-center">
+            <div className="relative flex items-center min-w-0 max-w-[155px] sm:max-w-[260px]">
               <label htmlFor="chat-model-select" className="sr-only">
                 Select model
               </label>
               <select
                 id="chat-model-select"
                 value={activeModelId}
-                onChange={(e) => onSelectModel(e.target.value)}
-                className="appearance-none rounded-lg border border-emerald-500/30 bg-white dark:bg-[#0D110F] ps-3 pe-8 py-2 text-xs font-semibold text-emerald-700 dark:text-emerald-400 focus:border-emerald-500 focus:outline-none min-h-[38px] cursor-pointer"
+                onChange={(e) => {
+                  onSelectModel(e.target.value);
+                  setError(null);
+                  setErrorCode(null);
+                  setErrorStatus(null);
+                }}
+                className="w-full truncate appearance-none rounded-lg border border-emerald-500/30 bg-white dark:bg-[#0D110F] ps-2.5 sm:ps-3 pe-7 sm:pe-8 py-2 text-xs font-semibold text-emerald-700 dark:text-emerald-400 focus:border-emerald-500 focus:outline-none min-h-[38px] cursor-pointer"
               >
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.displayName} ({getModelStatusMeta(m).shortLabel})
-                  </option>
-                ))}
+                {models.map((m) => {
+                  const access = user ? canAccessModel({ role: user.role, plan: user.plan }, m) : { allowed: m.requiredPlan === 'free' };
+                  const lockSuffix = !access.allowed ? ` · ${m.requiredPlan.toUpperCase()} / Dev Locked` : '';
+                  return (
+                    <option key={m.id} value={m.id}>
+                      {m.displayName} ({getModelStatusMeta(m).shortLabel}){lockSuffix}
+                    </option>
+                  );
+                })}
               </select>
-              <ChevronDown className="w-3.5 h-3.5 text-zinc-400 absolute end-2.5 pointer-events-none" />
+              <ChevronDown className="w-3.5 h-3.5 text-zinc-400 absolute end-2 sm:end-2.5 pointer-events-none" />
             </div>
 
             {/* Orchestration Mode Selector */}
-            <div className="relative flex items-center">
+            <div className="relative flex items-center min-w-0 max-w-[112px] sm:max-w-none shrink">
               <label htmlFor="chat-orchestrator-mode" className="sr-only">
                 Orchestration Mode
               </label>
@@ -786,7 +1123,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 aria-label="Orchestration Mode"
                 value={orchestrationMode}
                 onChange={(e) => setOrchestrationMode(e.target.value as OrchestratorMode)}
-                className="appearance-none rounded-lg border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] ps-2.5 pe-7 py-2 text-xs font-medium text-zinc-700 dark:text-zinc-200 focus:border-emerald-500 focus:outline-none min-h-[38px] cursor-pointer"
+                className="w-full truncate appearance-none rounded-lg border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] ps-2 sm:ps-2.5 pe-6 sm:pe-7 py-2 text-xs font-medium text-zinc-700 dark:text-zinc-200 focus:border-emerald-500 focus:outline-none min-h-[38px] cursor-pointer"
               >
                 <option value="auto">Mode: Auto</option>
                 <option value="fast">Fast</option>
@@ -1018,210 +1355,37 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
               {filteredMessages.map((m, idx) => {
                 const isLastAssistant =
                   m.role === 'assistant' && idx === filteredMessages.length - 1 && !streaming;
-                const isLong = m.content.length > 2200;
-                const isExpanded = expandedMsgs[m.id] ?? true;
-                const displayBody = isLong && !isExpanded ? `${m.content.slice(0, 1200)}...` : m.content;
+                const authorLabel =
+                  m.role === 'user'
+                    ? user?.displayName ?? 'You'
+                    : (m.modelId ? modelNameById.get(m.modelId) : undefined) ?? 'LOODY';
 
                 return (
-                  <article
+                  <MemoMessageBubble
                     key={m.id}
-                    className={`rounded-2xl p-4 sm:p-5 ${
-                      m.role === 'user'
-                        ? 'bg-emerald-50/70 dark:bg-[#0F1713] border border-emerald-500/25 ms-auto max-w-[92%] sm:max-w-[82%]'
-                        : 'bg-white dark:bg-[#0A0E0C] border border-zinc-200 dark:border-white/8'
-                    }`}
-                  >
-                    <div className="mb-2 flex items-center justify-between gap-2 text-xs text-zinc-500 dark:text-zinc-400">
-                      <span className="font-semibold text-zinc-800 dark:text-zinc-200">
-                        {m.role === 'user'
-                          ? user?.displayName ?? 'You'
-                          : models.find((x) => x.id === m.modelId)?.displayName ?? 'LOODY'}
-                      </span>
-                      {m.role === 'assistant' && typeof m.outputTokens === 'number' && (
-                        <span className="font-mono tabular-nums text-[11px] text-zinc-400">
-                          {m.inputTokens} in · {m.outputTokens} out ·{' '}
-                          {m.tokenAccountingType === 'provider_reported' ? 'Exact' : 'Est.'}
-                        </span>
-                      )}
-                    </div>
-
-                    {m.attachments && m.attachments.length > 0 && (
-                      <div className="mb-2 flex flex-wrap gap-1.5">
-                        {m.attachments.map((att, aIdx) => (
-                          <span
-                            key={aIdx}
-                            className="rounded-lg border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#050706] px-2 py-1 text-[11px] text-zinc-600 dark:text-zinc-300"
-                          >
-                            {att.name}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-
-                    {editingMsgId === m.id ? (
-                      <div className="space-y-2">
-                        <textarea
-                          value={editingText}
-                          onChange={(e) => setEditingText(e.target.value)}
-                          rows={3}
-                          className="w-full rounded-xl border border-emerald-500/40 bg-white dark:bg-[#050706] p-3 text-sm text-zinc-900 dark:text-white focus:outline-none"
-                        />
-                        <div className="flex gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const next = editingText.trim();
-                              setEditingMsgId(null);
-                              if (next && activeConvId) {
-                                runStream({
-                                  promptText: next,
-                                  mode: 'edit_resend',
-                                  targetMessageId: m.id,
-                                  convId: activeConvId,
-                                });
-                              }
-                            }}
-                            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 min-h-[36px] cursor-pointer"
-                          >
-                            {t(language, 'saveAndResend')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setEditingMsgId(null)}
-                            className="rounded-lg border border-zinc-300 dark:border-white/10 px-3 py-1.5 text-xs text-zinc-600 dark:text-zinc-300 min-h-[36px] cursor-pointer"
-                          >
-                            {t(language, 'cancel')}
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="prose prose-zinc dark:prose-invert prose-sm max-w-none prose-code:text-emerald-700 dark:prose-code:text-emerald-300">
-                        <InlineMarkdownErrorBoundary fallbackText={displayBody} resetKey={displayBody}>
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm, remarkMath]}
-                            rehypePlugins={[rehypeKatex, rehypeHighlight]}
-                            components={markdownComponents}
-                          >
-                            {displayBody}
-                          </ReactMarkdown>
-                        </InlineMarkdownErrorBoundary>
-                      </div>
-                    )}
-
-                    {isLong && (
-                      <button
-                        type="button"
-                        onClick={() => setExpandedMsgs((prev) => ({ ...prev, [m.id]: !isExpanded }))}
-                        className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400 cursor-pointer"
-                      >
-                        <ChevronRight className={`w-3.5 h-3.5 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
-                        <span>{isExpanded ? 'Collapse long response' : 'Expand full response'}</span>
-                      </button>
-                    )}
-
-                    {/* Knowledge Citations */}
-                    {m.role === 'assistant' && m.citations && m.citations.length > 0 && (
-                      <div className="mt-3 rounded-xl border border-emerald-500/20 bg-zinc-50 dark:bg-[#050706] p-3 text-xs space-y-2">
-                        <button
-                          type="button"
-                          onClick={() => setOpenCitationMsgId((prev) => (prev === m.id ? null : m.id))}
-                          className="inline-flex items-center gap-1.5 font-medium text-emerald-700 dark:text-emerald-300 cursor-pointer"
-                        >
-                          <BookOpen className="w-3.5 h-3.5" />
-                          <span>
-                            {m.citations.length} Knowledge Source{m.citations.length === 1 ? '' : 's'} Cited
-                          </span>
-                        </button>
-                        {openCitationMsgId === m.id && (
-                          <div className="space-y-1.5 pt-1 border-t border-zinc-200 dark:border-white/10">
-                            {m.citations.map((c) => (
-                              <div key={c.chunkId} className="rounded-lg bg-white dark:bg-[#0D110F] p-2 border border-zinc-200 dark:border-white/5">
-                                <div className="flex items-center justify-between text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
-                                  <span>{c.title}</span>
-                                  <span>{c.retrievalMethod} · {c.score.toFixed(2)}</span>
-                                </div>
-                                <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-400 line-clamp-2">{c.snippet}</p>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Message Actions */}
-                    <div className="mt-3 flex flex-wrap items-center gap-2 pt-2 border-t border-zinc-100 dark:border-white/5">
-                      <button
-                        type="button"
-                        onClick={() => handleCopy(m.id, m.content)}
-                        className="inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white px-2 py-1 rounded hover:bg-zinc-100 dark:hover:bg-white/5 cursor-pointer"
-                      >
-                        {copiedId === m.id ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                        <span>{copiedId === m.id ? t(language, 'copied') : t(language, 'copy')}</span>
-                      </button>
-
-                      {m.role === 'assistant' && (
-                        <button
-                          type="button"
-                          onClick={() => handleToggleSpeak(m.id, m.content)}
-                          className={`inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded cursor-pointer ${
-                            speakingMsgId === m.id
-                              ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                              : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white hover:bg-zinc-100 dark:hover:bg-white/5'
-                          }`}
-                        >
-                          {speakingMsgId === m.id ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-                          <span>{speakingMsgId === m.id ? t(language, 'stopSpeaking') : t(language, 'readAloud')}</span>
-                        </button>
-                      )}
-
-                      {m.role === 'user' && !streaming && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEditingMsgId(m.id);
-                            setEditingText(m.content);
-                          }}
-                          className="inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white px-2 py-1 rounded hover:bg-zinc-100 dark:hover:bg-white/5 cursor-pointer"
-                        >
-                          <Pencil className="w-3.5 h-3.5" />
-                          <span>{t(language, 'edit')}</span>
-                        </button>
-                      )}
-
-                      {isLastAssistant && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const lastUser = [...messages].reverse().find((x) => x.role === 'user');
-                              if (lastUser && activeConvId) {
-                                runStream({ promptText: lastUser.content, mode: 'regenerate', convId: activeConvId });
-                              }
-                            }}
-                            className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 px-2 py-1 rounded hover:bg-emerald-500/10 cursor-pointer"
-                          >
-                            <RotateCcw className="w-3.5 h-3.5" />
-                            <span>{t(language, 'regenerate')}</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (activeConvId) {
-                                runStream({
-                                  promptText: 'Continue',
-                                  mode: 'continue',
-                                  convId: activeConvId,
-                                });
-                              }
-                            }}
-                            className="inline-flex items-center gap-1 text-[11px] text-zinc-600 dark:text-zinc-300 px-2 py-1 rounded hover:bg-zinc-100 dark:hover:bg-white/5 cursor-pointer"
-                          >
-                            <span>{t(language, 'continueResponse')}</span>
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </article>
+                    message={m}
+                    language={language}
+                    authorLabel={authorLabel}
+                    isLastAssistant={isLastAssistant}
+                    isCopied={copiedId === m.id}
+                    isSpeaking={speakingMsgId === m.id}
+                    isExpanded={expandedMsgs[m.id] ?? true}
+                    isEditing={editingMsgId === m.id}
+                    editingText={editingMsgId === m.id ? editingText : ''}
+                    isCitationOpen={openCitationMsgId === m.id}
+                    streaming={streaming}
+                    markdownComponents={markdownComponents}
+                    onCopy={handleCopy}
+                    onToggleSpeak={handleToggleSpeak}
+                    onToggleExpand={handleToggleExpandMsg}
+                    onToggleCitation={handleToggleCitationMsg}
+                    onStartEdit={handleStartEditMsg}
+                    onChangeEditingText={setEditingText}
+                    onSaveEdit={handleSaveEditMsg}
+                    onCancelEdit={handleCancelEditMsg}
+                    onRegenerate={handleRegenerateLast}
+                    onContinue={handleContinueLast}
+                  />
                 );
               })}
 
@@ -1241,8 +1405,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                       resetKey={streamingText}
                     >
                       <ReactMarkdown
-                        remarkPlugins={[remarkGfm, remarkMath]}
-                        rehypePlugins={[rehypeKatex, rehypeHighlight]}
+                        remarkPlugins={REMARK_PLUGINS}
+                        rehypePlugins={REHYPE_PLUGINS}
                         components={markdownComponents}
                       >
                         {streamingText || '...'}
@@ -1256,7 +1420,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
           )}
         </div>
 
-        {/* Error Banner with Retry */}
+        {/* Error Banner with Entitlement Recovery or Retry */}
         {error && (
           <div className="mx-auto w-full max-w-3xl px-4 pb-2">
             <div
@@ -1267,7 +1431,42 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 <AlertCircle className="w-4 h-4 text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
                 <span>{error}</span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {(errorStatus === 403 || errorCode === 'ENTITLEMENT_REQUIRED') && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectModel('sonic-3.5');
+                        setError(null);
+                        setErrorCode(null);
+                        setErrorStatus(null);
+                      }}
+                      className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-emerald-500 cursor-pointer"
+                    >
+                      Switch to Sonic 3.5
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectModel('sonic-3');
+                        setError(null);
+                        setErrorCode(null);
+                        setErrorStatus(null);
+                      }}
+                      className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-white/80 dark:bg-[#0D110F] px-2.5 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300 hover:border-emerald-500 cursor-pointer"
+                    >
+                      Switch to Sonic 3
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => (onOpenUsage ? onOpenUsage() : onOpenModelHub())}
+                      className="inline-flex items-center gap-1 rounded-lg border border-red-500/30 px-2.5 py-1 text-[11px] font-medium text-red-700 dark:text-red-200 hover:bg-red-500/10 cursor-pointer"
+                    >
+                      {onOpenUsage ? 'Plans & Usage' : 'Model Hub'}
+                    </button>
+                  </>
+                )}
                 {lastFailedRetry && !streaming && (
                   <button
                     type="button"
@@ -1280,7 +1479,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 )}
                 <button
                   type="button"
-                  onClick={() => setError(null)}
+                  onClick={() => {
+                    setError(null);
+                    setErrorCode(null);
+                    setErrorStatus(null);
+                  }}
                   aria-label="Dismiss error"
                   className="text-red-500 hover:text-red-700 dark:text-red-300 dark:hover:text-white cursor-pointer"
                 >
@@ -1412,7 +1615,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
               <button
                 type="button"
-                title={supportsVision ? t(language, 'attachImage') : 'Attaches image & switches to LOODY Vision 1'}
+                title={t(language, 'attachImage')}
                 aria-label={t(language, 'attachImage')}
                 onClick={() => imageInputRef.current?.click()}
                 className="flex h-11 w-10 shrink-0 items-center justify-center rounded-xl text-zinc-500 hover:bg-zinc-200/70 dark:text-zinc-400 dark:hover:bg-white/5 hover:text-emerald-600 cursor-pointer"
@@ -1490,7 +1693,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                 <button
                   type="button"
                   onClick={handleSend}
-                  disabled={!input.trim()}
+                  disabled={!hasComposerPayload}
                   aria-label={t(language, 'send')}
                   className="inline-flex h-11 items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 transition-colors cursor-pointer"
                 >
@@ -1522,9 +1725,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
             <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Active Model</div>
             <div className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#0D110F] p-3 space-y-1">
               <div className="font-semibold text-emerald-600 dark:text-emerald-400">{activeModel?.displayName}</div>
-              <div className="text-zinc-500 font-mono text-[11px]">{activeModel?.provider} · {activeModel?.upstreamModelId}</div>
+              <div className="text-zinc-500 text-[11px]">
+                {activeModel?.speedClass} · {activeModel?.reasoningLevel} Reasoning
+              </div>
               <div className="text-[11px] text-zinc-500">
-                Fallback routing: {user?.allowFallback ? 'Enabled' : 'Disabled'}
+                Intra-model resilience: {user?.allowFallback ? 'Enabled' : 'Disabled'}
               </div>
             </div>
           </div>

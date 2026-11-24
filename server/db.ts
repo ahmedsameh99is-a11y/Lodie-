@@ -11,12 +11,16 @@ import type {
   PublicUser,
 } from '../src/shared/types';
 import { decryptSecret } from './security';
+import { resolveProviderCredentials } from './providers/catalog';
 
 export const DATA_DIR = path.resolve(process.cwd(), 'data');
 export const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-const DB_PATH = path.join(DATA_DIR, 'loody.db');
+const DB_PATH = process.env.LOODY_DB_PATH
+  ? path.resolve(process.env.LOODY_DB_PATH)
+  : path.join(DATA_DIR, 'loody.db');
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -289,7 +293,6 @@ function runMigrations() {
         );
         CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_owner ON knowledge_chunks(user_id, project_id, source_id);
 
-        CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, pinned DESC, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, user_id, created_at ASC);
         CREATE INDEX IF NOT EXISTS idx_workspace_files_user ON workspace_files(user_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, updated_at DESC);
@@ -492,6 +495,25 @@ function runMigrations() {
         CREATE INDEX IF NOT EXISTS idx_kore_reviews_ws ON kore_reviews(workspace_id, user_id, created_at DESC);
       `,
     },
+    {
+      version: 7,
+      name: 'v7_multi_provider_telemetry',
+      sql: `
+        CREATE TABLE IF NOT EXISTS provider_health (
+          provider TEXT PRIMARY KEY,
+          circuit_state TEXT NOT NULL DEFAULT 'closed',
+          consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          failure_count INTEGER NOT NULL DEFAULT 0,
+          success_count INTEGER NOT NULL DEFAULT 0,
+          avg_latency_ms INTEGER,
+          last_error_class TEXT,
+          last_error TEXT,
+          cooldown_until TEXT,
+          last_checked_at TEXT,
+          updated_at TEXT NOT NULL
+        );
+      `,
+    },
   ];
 
   const insertMig = db.prepare(
@@ -537,11 +559,16 @@ function runMigrations() {
   ensureColumn('project_files', 'summary', "TEXT NOT NULL DEFAULT ''");
 
   ensureColumn('messages', 'citations_json', 'TEXT');
+  ensureColumn('messages', 'upstream_model_id', 'TEXT');
   ensureColumn('token_usage', 'task_type', "TEXT NOT NULL DEFAULT 'chat'");
+  ensureColumn('token_usage', 'upstream_model_id', 'TEXT');
   ensureColumn('model_registry', 'error_class', 'TEXT');
   ensureColumn('model_registry', 'avg_latency_ms', 'INTEGER');
   ensureColumn('model_registry', 'last_error_detail', 'TEXT');
   ensureColumn('agent_runs', 'idempotency_key', 'TEXT');
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, pinned DESC, updated_at DESC);'
+  );
   db.exec(
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_idempotency ON agent_runs(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;'
   );
@@ -552,56 +579,21 @@ export function evaluateProviderCredentials(params: {
   hasEncryptedKey: boolean;
   customBaseUrl?: string | null;
 }): { configured: boolean; configuredReason: string; missingReason: string } {
-  const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
-  const hasOpenAIKey = Boolean(process.env.OPENAI_API_KEY);
-  const hasAnthropicKey = Boolean(process.env.ANTHROPIC_API_KEY);
-
-  switch (params.provider) {
-    case 'gemini':
-      return {
-        configured: params.hasEncryptedKey || hasGeminiKey,
-        configuredReason: params.hasEncryptedKey
-          ? 'Configured via Developer Gemini API key (connectivity test pending)'
-          : 'Configured via server-side GEMINI_API_KEY adapter (connectivity test pending)',
-        missingReason: 'GEMINI_API_KEY not configured on server',
-      };
-    case 'openai-compatible':
-      return {
-        configured: params.hasEncryptedKey || hasOpenAIKey,
-        configuredReason: params.hasEncryptedKey
-          ? 'Configured via Developer OpenAI-compatible credentials (connectivity test pending)'
-          : 'Configured via OPENAI_API_KEY adapter (connectivity test pending)',
-        missingReason: 'Awaiting OPENAI_API_KEY or Developer provider config',
-      };
-    case 'anthropic-compatible':
-      return {
-        configured: params.hasEncryptedKey || hasAnthropicKey,
-        configuredReason: params.hasEncryptedKey
-          ? 'Configured via Developer Anthropic-compatible credentials (connectivity test pending)'
-          : 'Configured via ANTHROPIC_API_KEY adapter (connectivity test pending)',
-        missingReason: 'Awaiting ANTHROPIC_API_KEY or Developer provider config',
-      };
-    case 'hosted-oss': {
-      const hasBaseUrl = Boolean(process.env.HOSTED_OSS_BASE_URL || params.customBaseUrl);
-      return {
-        configured: hasBaseUrl,
-        configuredReason: 'Configured via Hosted OSS base URL (connectivity test pending)',
-        missingReason: 'Awaiting HOSTED_OSS_BASE_URL or custom base URL configuration',
-      };
-    }
-    default:
-      return {
-        configured: false,
-        configuredReason: '',
-        missingReason: `Unsupported provider adapter: ${params.provider}`,
-      };
-  }
+  const resolved = resolveProviderCredentials({
+    provider: params.provider,
+    hasEncryptedKey: params.hasEncryptedKey,
+    customBaseUrl: params.customBaseUrl,
+  });
+  return {
+    configured: resolved.configured,
+    configuredReason: resolved.configuredReason,
+    missingReason: resolved.missingReason,
+  };
 }
 
 function seedDefaults() {
   const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
-  const hasOpenAIKey = Boolean(process.env.OPENAI_API_KEY);
-  const hasAnthropicKey = Boolean(process.env.ANTHROPIC_API_KEY);
+  const hasGroqKey = Boolean(process.env.GROQ_API_KEY?.trim());
 
   const models = [
     {
@@ -609,21 +601,21 @@ function seedDefaults() {
       display_name: 'Sonic 3',
       tier: 'free',
       required_plan: 'free',
-      provider: 'gemini',
-      upstream_model_id: 'gemini-3.1-flash-lite',
-      description: 'Ultra-low latency everyday assistant calibrated for rapid drafting, translation, and quick lookups.',
+      provider: 'groq',
+      upstream_model_id: 'openai/gpt-oss-20b',
+      description: 'Ultra-low latency everyday assistant calibrated for rapid drafting, translation, vision Q&A, and quick lookups.',
       speed_class: 'Ultra-Fast',
       reasoning_level: 'Standard',
-      context_limit: 1000000,
-      input_modalities_json: JSON.stringify(['text']),
+      context_limit: 131072,
+      input_modalities_json: JSON.stringify(['text', 'image']),
       output_modalities_json: JSON.stringify(['text']),
       supports_tools: 1,
       supports_streaming: 1,
-      pricing_summary: 'Included in Free Tier (subject to daily quota)',
-      availability: hasGeminiKey ? 'connected' : 'awaiting_config',
-      availability_reason: hasGeminiKey
-        ? 'Configured via server-side GEMINI_API_KEY adapter (connectivity test pending)'
-        : 'GEMINI_API_KEY not configured on server',
+      pricing_summary: 'Included in Free Tier (60,000 tokens/day cap)',
+      availability: hasGroqKey ? 'connected' : 'awaiting_config',
+      availability_reason: hasGroqKey
+        ? 'Configured via server-side GROQ_API_KEY adapter (connectivity test pending)'
+        : 'GROQ_API_KEY not configured on server',
       thinking_preset: 'MINIMAL',
     },
     {
@@ -632,16 +624,16 @@ function seedDefaults() {
       tier: 'free',
       required_plan: 'free',
       provider: 'gemini',
-      upstream_model_id: 'gemini-4-hydrogen',
-      description: 'High-speed balanced general intelligence engine for coding, structured analysis, and long-context chat.',
+      upstream_model_id: 'gemini-3.1-flash-lite',
+      description: 'High-speed balanced general intelligence engine for coding, vision, structured analysis, and long-context chat.',
       speed_class: 'Fast',
       reasoning_level: 'High',
       context_limit: 1000000,
-      input_modalities_json: JSON.stringify(['text']),
+      input_modalities_json: JSON.stringify(['text', 'image']),
       output_modalities_json: JSON.stringify(['text']),
       supports_tools: 1,
       supports_streaming: 1,
-      pricing_summary: 'Included in Free Tier (subject to daily quota)',
+      pricing_summary: 'Included in Free Tier (50,000 tokens/day cap)',
       availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
         ? 'Configured via server-side GEMINI_API_KEY adapter (connectivity test pending)'
@@ -650,47 +642,46 @@ function seedDefaults() {
     },
     {
       id: 'lodie-5.5',
-      display_name: 'Lodie 5.5',
+      display_name: 'LOODY 5.5',
       tier: 'premium',
-      required_plan: 'premium',
+      required_plan: 'free',
       provider: 'gemini',
-      upstream_model_id: 'gemini-4-hydrogen',
-      description: 'Flagship deep-reasoning workspace model configured for multi-step architecture, root-cause debugging, and security auditing.',
+      upstream_model_id: 'gemini-3.1-flash-lite',
+      description: 'Flagship deep-reasoning workspace model configured for multi-step architecture, multimodal analysis, root-cause debugging, and security auditing.',
       speed_class: 'Deep Reasoning',
       reasoning_level: 'Deep',
       context_limit: 1000000,
-      input_modalities_json: JSON.stringify(['text']),
+      input_modalities_json: JSON.stringify(['text', 'image']),
       output_modalities_json: JSON.stringify(['text']),
       supports_tools: 1,
       supports_streaming: 1,
-      pricing_summary: 'Premium Plan & Developer Role',
+      pricing_summary: 'Included in Free Tier (35,000 tokens/day cap)',
       availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
-        ? 'Configured via server-side GEMINI_API_KEY adapter (XHIGH reasoning preset; connectivity test pending)'
+        ? 'Configured via server-side GEMINI_API_KEY adapter (HIGH thinking preset; connectivity test pending)'
         : 'GEMINI_API_KEY not configured on server',
-      thinking_preset: 'XHIGH',
+      thinking_preset: 'HIGH',
     },
     {
       id: 'fables-5.3',
       display_name: 'Fables 5.3',
       tier: 'premium',
-      required_plan: 'premium',
-      provider: hasAnthropicKey ? 'anthropic-compatible' : 'openai-compatible',
-      upstream_model_id: hasAnthropicKey ? 'claude-sonnet-4-5' : 'gpt-4.1',
-      description: 'Editorial narrative and nuanced synthesis engine configurable for Anthropic-compatible or OpenAI-compatible inference providers.',
+      required_plan: 'free',
+      provider: 'groq',
+      upstream_model_id: 'openai/gpt-oss-120b',
+      description: 'Editorial narrative, multimodal storytelling, and script synthesis engine tuned for rich Arabic and English prose.',
       speed_class: 'Balanced',
       reasoning_level: 'High',
-      context_limit: 200000,
-      input_modalities_json: JSON.stringify(['text']),
+      context_limit: 131072,
+      input_modalities_json: JSON.stringify(['text', 'image']),
       output_modalities_json: JSON.stringify(['text']),
       supports_tools: 1,
       supports_streaming: 1,
-      pricing_summary: 'Premium Plan & Developer Role (Provider-Configurable)',
-      availability: hasAnthropicKey || hasOpenAIKey ? 'connected' : 'awaiting_config',
-      availability_reason:
-        hasAnthropicKey || hasOpenAIKey
-          ? 'Configured via external provider adapter (connectivity test pending)'
-          : 'Awaiting OPENAI_API_KEY or ANTHROPIC_API_KEY (configurable by Developer)',
+      pricing_summary: 'Included in Free Tier (40,000 tokens/day cap)',
+      availability: hasGroqKey ? 'connected' : 'awaiting_config',
+      availability_reason: hasGroqKey
+        ? 'Configured via server-side GROQ_API_KEY adapter (Arabic literary quality verified; connectivity test pending)'
+        : 'GROQ_API_KEY not configured on server',
       thinking_preset: 'HIGH',
     },
     {
@@ -699,7 +690,7 @@ function seedDefaults() {
       tier: 'multimodal',
       required_plan: 'free',
       provider: 'gemini',
-      upstream_model_id: 'gemini-4-hydrogen',
+      upstream_model_id: 'gemini-3.1-flash-lite',
       description: 'Multimodal visual comprehension model for UI screenshots, diagrams, documents, and image-grounded reasoning.',
       speed_class: 'Balanced',
       reasoning_level: 'High',
@@ -708,12 +699,12 @@ function seedDefaults() {
       output_modalities_json: JSON.stringify(['text']),
       supports_tools: 1,
       supports_streaming: 1,
-      pricing_summary: 'Multimodal Tier (Free preview quota / Premium extended)',
+      pricing_summary: 'Included in Free Tier (35,000 tokens/day cap)',
       availability: hasGeminiKey ? 'connected' : 'awaiting_config',
       availability_reason: hasGeminiKey
         ? 'Configured via server-side GEMINI_API_KEY Multimodal adapter (connectivity test pending)'
         : 'GEMINI_API_KEY not configured on server',
-      thinking_preset: 'MEDIUM',
+      thinking_preset: 'LOW',
     },
   ];
 
@@ -732,6 +723,173 @@ function seedDefaults() {
 
   for (const m of models) {
     upsertModel.run(m);
+  }
+
+  // Idempotent Phase 0 migration: move Lodie 5.5 off quota-throttled/probe-changed candidates onto gemini-3.6-flash (HIGH thinking)
+  const hasMigrationV6 = Boolean(
+    db.prepare('SELECT 1 FROM schema_migrations WHERE version = 6').get()
+  );
+  if (!hasMigrationV6) {
+    db.prepare(`
+      UPDATE model_registry
+      SET provider = 'gemini',
+          upstream_model_id = 'gemini-3.6-flash',
+          thinking_preset = 'HIGH',
+          availability = ?,
+          availability_reason = ?,
+          last_tested_at = NULL,
+          error_class = ?,
+          avg_latency_ms = NULL,
+          last_error_detail = NULL
+      WHERE id = 'lodie-5.5'
+    `).run(
+      hasGeminiKey ? 'connected' : 'awaiting_config',
+      hasGeminiKey
+        ? 'Configured via server-side GEMINI_API_KEY adapter (HIGH thinking preset; connectivity test pending)'
+        : 'GEMINI_API_KEY not configured on server',
+      hasGeminiKey ? null : 'configuration_error'
+    );
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+      6,
+      'v6_lodie_5_5_gemini_3_6_flash_high',
+      new Date().toISOString()
+    );
+  }
+
+  // Idempotent Five Identities migration: align display_name ('LOODY 5.5') and live-verified primary upstream routes cleanly
+  const hasMigrationV8 = Boolean(
+    db.prepare('SELECT 1 FROM schema_migrations WHERE version = 8').get()
+  );
+  if (!hasMigrationV8) {
+    const updatePrimary = db.prepare(`
+      UPDATE model_registry
+      SET display_name = ?,
+          provider = ?,
+          upstream_model_id = ?,
+          description = ?,
+          context_limit = ?,
+          pricing_summary = ?,
+          thinking_preset = ?,
+          availability = ?,
+          availability_reason = ?,
+          last_tested_at = NULL,
+          error_class = ?,
+          avg_latency_ms = NULL,
+          last_error_detail = NULL
+      WHERE id = ?
+    `);
+    for (const m of models) {
+      updatePrimary.run(
+        m.display_name,
+        m.provider,
+        m.upstream_model_id,
+        m.description,
+        m.context_limit,
+        m.pricing_summary,
+        m.thinking_preset,
+        m.availability,
+        m.availability_reason,
+        m.availability === 'awaiting_config' ? 'configuration_error' : null,
+        m.id
+      );
+    }
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+      8,
+      'v8_five_identities_and_upstream_metadata',
+      new Date().toISOString()
+    );
+  }
+
+  // Idempotent Phase 0.3 migration: heal stale mismatched backup authentication_error on primary Gemini models (e.g. loody-vision-1)
+  const hasMigrationV9 = Boolean(
+    db.prepare('SELECT 1 FROM schema_migrations WHERE version = 9').get()
+  );
+  if (!hasMigrationV9) {
+    db.prepare(`
+      UPDATE model_registry
+      SET availability = ?,
+          availability_reason = ?,
+          error_class = NULL,
+          last_error_detail = NULL
+      WHERE id = 'loody-vision-1'
+        AND provider = 'gemini'
+        AND availability = 'authentication_error'
+    `).run(
+      hasGeminiKey ? 'connected' : 'awaiting_config',
+      hasGeminiKey
+        ? 'Configured via server-side GEMINI_API_KEY Multimodal adapter (connectivity test pending)'
+        : 'GEMINI_API_KEY not configured on server'
+    );
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+      9,
+      'v9_heal_mismatched_vision_auth_error',
+      new Date().toISOString()
+    );
+  }
+
+  // Idempotent Phase 0.3 Task 1 migration: align Gemini models onto live-verified gemini-3.1-flash-lite away from 20 RPD preview bottlenecks
+  const hasMigrationV10 = Boolean(
+    db.prepare('SELECT 1 FROM schema_migrations WHERE version = 10').get()
+  );
+  if (!hasMigrationV10) {
+    const updateUpstream = db.prepare(`
+      UPDATE model_registry
+      SET provider = 'gemini',
+          upstream_model_id = 'gemini-3.1-flash-lite',
+          thinking_preset = ?,
+          availability = ?,
+          availability_reason = ?,
+          error_class = NULL,
+          last_error_detail = NULL
+      WHERE id = ? AND provider = 'gemini'
+    `);
+    const connState = hasGeminiKey ? 'connected' : 'awaiting_config';
+    const connReason = hasGeminiKey
+      ? 'Configured via server-side GEMINI_API_KEY adapter (gemini-3.1-flash-lite; connectivity test pending)'
+      : 'GEMINI_API_KEY not configured on server';
+    updateUpstream.run('LOW', connState, connReason, 'sonic-3.5');
+    updateUpstream.run('HIGH', connState, connReason, 'lodie-5.5');
+    updateUpstream.run('LOW', connState, connReason, 'loody-vision-1');
+    db.prepare("DELETE FROM provider_health WHERE provider = 'gemini' AND circuit_state = 'open'").run();
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+      10,
+      'v10_gemini_3_1_flash_lite_primary_rescue',
+      new Date().toISOString()
+    );
+  }
+
+  // Idempotent Phase 0.3 Task 3 & 4 migration: unlock all 5 models for Free tier, enable universal text+image parity, and upgrade legacy Free quota defaults
+  const hasMigrationV11 = Boolean(
+    db.prepare('SELECT 1 FROM schema_migrations WHERE version = 11').get()
+  );
+  if (!hasMigrationV11) {
+    const updateModelParity = db.prepare(`
+      UPDATE model_registry
+      SET required_plan = 'free',
+          input_modalities_json = ?,
+          pricing_summary = ?
+      WHERE id = ?
+    `);
+    for (const m of models) {
+      updateModelParity.run(m.input_modalities_json, m.pricing_summary, m.id);
+    }
+
+    // Upgrade only quota limit columns for existing free-tier accounts still on legacy defaults (never mutate role or plan)
+    db.prepare(`
+      UPDATE users
+      SET daily_token_limit = ?,
+          monthly_token_limit = ?,
+          updated_at = ?
+      WHERE plan = 'free'
+        AND daily_token_limit = 25000
+        AND monthly_token_limit = 300000
+    `).run(DEFAULT_PLAN_LIMITS.free.daily, DEFAULT_PLAN_LIMITS.free.monthly, new Date().toISOString());
+
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+      11,
+      'v11_unlock_free_models_generous_quotas_and_vision',
+      new Date().toISOString()
+    );
   }
 
   // Reconcile credential availability WITHOUT overwriting probe-derived availability/latency/error_class.
@@ -768,6 +926,10 @@ function seedDefaults() {
     });
 
     if (!cred.configured) {
+      // Never clobber a previously verified model status just because a temporary shell/test process lacks runtime env secrets.
+      if (row.last_tested_at && process.env.LOODY_SERVER_RUNTIME !== '1') {
+        continue;
+      }
       if (row.availability !== 'awaiting_config' || row.error_class !== 'configuration_error') {
         setAwaitingConfig.run(cred.missingReason, row.id);
       }
@@ -1055,10 +1217,14 @@ export function mapRowToBrandedModel(row: Record<string, unknown>): BrandedModel
   };
 }
 
-export function getModelCredentials(modelId: string): { apiKey?: string; baseUrl?: string } {
+export function getModelCredentials(modelId: string): {
+  rowProvider?: string;
+  apiKey?: string;
+  baseUrl?: string;
+} {
   const row = db
-    .prepare('SELECT encrypted_api_key, custom_base_url FROM model_registry WHERE id = ?')
-    .get(modelId) as { encrypted_api_key: string | null; custom_base_url: string | null } | undefined;
+    .prepare('SELECT provider, encrypted_api_key, custom_base_url FROM model_registry WHERE id = ?')
+    .get(modelId) as { provider: string | null; encrypted_api_key: string | null; custom_base_url: string | null } | undefined;
   if (!row) return {};
   let apiKey: string | undefined;
   if (row.encrypted_api_key) {
@@ -1069,6 +1235,7 @@ export function getModelCredentials(modelId: string): { apiKey?: string; baseUrl
     }
   }
   return {
+    rowProvider: row.provider ?? undefined,
     apiKey,
     baseUrl: row.custom_base_url ?? undefined,
   };

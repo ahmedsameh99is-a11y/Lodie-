@@ -81,6 +81,19 @@ export const SubscriptionsUsageView: React.FC<SubscriptionsUsageViewProps> = ({
   const monthlyPct = summary
     ? Math.min(100, Math.round((summary.usage.monthlyUsed / Math.max(1, summary.usage.monthlyLimit)) * 100))
     : 0;
+  const dailyRemaining = summary
+    ? summary.usage.dailyRemaining ?? Math.max(0, summary.usage.dailyLimit - summary.usage.dailyUsed)
+    : 0;
+  const monthlyRemaining = summary
+    ? summary.usage.monthlyRemaining ?? Math.max(0, summary.usage.monthlyLimit - summary.usage.monthlyUsed)
+    : 0;
+  const MODEL_LABELS: Record<string, string> = {
+    'sonic-3': 'Sonic 3',
+    'sonic-3.5': 'Sonic 3.5',
+    'lodie-5.5': 'LOODY 5.5',
+    'fables-5.3': 'Fables 5.3',
+    'loody-vision-1': 'LOODY Vision 1',
+  };
 
   return (
     <div className="mx-auto max-w-6xl px-4 sm:px-6 py-6 space-y-8">
@@ -89,7 +102,7 @@ export const SubscriptionsUsageView: React.FC<SubscriptionsUsageViewProps> = ({
           Plans, Quotas & Token Ledger
         </h2>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Provider-reported token usage is recorded separately from heuristic estimates. Quotas are enforced server-side.
+          Provider-reported token usage is recorded separately from heuristic estimates. Quotas and per-model budgets reset automatically at 00:00 UTC.
         </p>
       </div>
 
@@ -115,7 +128,12 @@ export const SubscriptionsUsageView: React.FC<SubscriptionsUsageViewProps> = ({
                   style={{ width: `${dailyPct}%` }}
                 />
               </div>
-              <div className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">{dailyPct}% of daily limit</div>
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                <span>{dailyPct}% used · {dailyRemaining.toLocaleString()} left</span>
+                {summary.usage.dailyResetAtUtc && (
+                  <span className="font-mono">Resets {summary.usage.dailyResetAtUtc.slice(11, 16)} UTC</span>
+                )}
+              </div>
             </div>
 
             <div className="rounded-2xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] p-5">
@@ -127,7 +145,12 @@ export const SubscriptionsUsageView: React.FC<SubscriptionsUsageViewProps> = ({
               <div className="mt-3 h-2 w-full rounded-full bg-zinc-100 dark:bg-[#050706] overflow-hidden">
                 <div className="h-full bg-emerald-500 transition-all" style={{ width: `${monthlyPct}%` }} />
               </div>
-              <div className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">{monthlyPct}% of monthly limit</div>
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                <span>{monthlyPct}% used · {monthlyRemaining.toLocaleString()} left</span>
+                {summary.usage.monthlyResetAtUtc && (
+                  <span className="font-mono">Resets {summary.usage.monthlyResetAtUtc.slice(0, 10)}</span>
+                )}
+              </div>
             </div>
 
             <div className="rounded-2xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] p-5">
@@ -143,6 +166,51 @@ export const SubscriptionsUsageView: React.FC<SubscriptionsUsageViewProps> = ({
               </div>
             </div>
           </section>
+
+          {summary.usage.perModelDaily && summary.usage.perModelDaily.length > 0 && (
+            <section className="rounded-2xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] p-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+                  Per-Model Daily Budgets
+                </div>
+                {summary.usage.dailyResetAtUtc && (
+                  <div className="text-[11px] font-mono text-zinc-500">
+                    Daily Reset: {summary.usage.dailyResetAtUtc.slice(0, 16).replace('T', ' ')} UTC
+                  </div>
+                )}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                {summary.usage.perModelDaily.map((entry) => {
+                  const pct = Math.min(100, Math.round((entry.used / Math.max(1, entry.limit)) * 100));
+                  return (
+                    <div
+                      key={entry.modelId}
+                      className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] p-3.5 space-y-2"
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-xs font-semibold text-zinc-900 dark:text-white truncate">
+                          {MODEL_LABELS[entry.modelId] ?? entry.modelId}
+                        </span>
+                        <span className="text-[10px] font-mono text-zinc-500 tabular-nums">{pct}%</span>
+                      </div>
+                      <div className="h-1.5 w-full rounded-full bg-zinc-200 dark:bg-white/10 overflow-hidden">
+                        <div
+                          className={`h-full transition-all ${pct >= 80 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                      <div dir="ltr" className="text-[11px] font-mono tabular-nums text-zinc-600 dark:text-zinc-300">
+                        {entry.used.toLocaleString()} / {entry.limit.toLocaleString()}
+                      </div>
+                      <div className="text-[10px] text-emerald-600 dark:text-emerald-400 font-mono tabular-nums">
+                        {entry.remaining.toLocaleString()} remaining
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
 
           {summary.usage.byTaskType && Object.keys(summary.usage.byTaskType).length > 0 && (
             <section className="rounded-2xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] p-5 space-y-3">

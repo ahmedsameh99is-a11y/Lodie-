@@ -15,6 +15,7 @@ import {
 import { api } from '../lib/api';
 import { deleteMemoryFromFirestore, syncMemoryToFirestore } from '../lib/firebase';
 import { triggerBrowserDownload } from '../shared/chatExport';
+import { canAccessModel } from '../shared/quotas';
 import type {
   BrandedModel,
   BuiltinTool,
@@ -79,13 +80,23 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
   }, [user?.id]);
 
   const loadFiles = async (pid: string) => {
-    const res = await api.getProjectFiles(pid);
-    setProjectFiles(res.files);
+    try {
+      const res = await api.getProjectFiles(pid);
+      setProjectFiles(res.files);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load project files.');
+      setProjectFiles([]);
+    }
   };
 
   const loadProjectMemories = async (pid: string) => {
-    const res = await api.getMemories({ scope: 'project', projectId: pid });
-    setProjectMemories(res.memories);
+    try {
+      const res = await api.getMemories({ scope: 'project', projectId: pid });
+      setProjectMemories(res.memories);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load project memories.');
+      setProjectMemories([]);
+    }
   };
 
   if (!user) {
@@ -149,27 +160,35 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
 
   const handleUploadProjectFile = async (projectId: string, file: File) => {
     setError(null);
+    if (file.size === 0) {
+      setError('Empty (0-byte) files cannot be uploaded.');
+      return;
+    }
     if (file.size > 4_000_000) {
       setError('Project files must be under 4 MB.');
       return;
     }
-    const dataBase64 = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result ?? '').split(',')[1] ?? '');
-      reader.onerror = () => reject(new Error('Failed to read file.'));
-      reader.readAsDataURL(file);
-    });
-    const isTextLike = /\.(txt|md|json|csv|ts|tsx|js|jsx|py|sql)$/i.test(file.name) || file.type.startsWith('text/');
-    const text = isTextLike ? (await file.text()).slice(0, 100_000) : '';
-    await api.uploadProjectFile(projectId, {
-      name: file.name,
-      mimeType: file.type || 'text/plain',
-      sizeBytes: file.size,
-      extractedText: text,
-      dataBase64,
-    });
-    await loadFiles(projectId);
-    onRefresh();
+    try {
+      const dataBase64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result ?? '').split(',')[1] ?? '');
+        reader.onerror = () => reject(new Error('Failed to read file.'));
+        reader.readAsDataURL(file);
+      });
+      const isTextLike = /\.(txt|md|json|csv|ts|tsx|js|jsx|py|sql)$/i.test(file.name) || file.type.startsWith('text/');
+      const text = isTextLike ? (await file.text()).slice(0, 100_000) : '';
+      await api.uploadProjectFile(projectId, {
+        name: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        sizeBytes: file.size,
+        extractedText: text,
+        dataBase64,
+      });
+      await loadFiles(projectId);
+      onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to upload project file.');
+    }
   };
 
   const handleAddProjectMemory = async (projectId: string) => {
@@ -259,11 +278,15 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
               onChange={(e) => setPreferredModelId(e.target.value)}
               className="w-full rounded-xl border border-zinc-300 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] px-3 py-2.5 text-sm text-zinc-900 dark:text-white min-h-[44px]"
             >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.displayName}
-                </option>
-              ))}
+              {models.map((m) => {
+                const access = canAccessModel({ role: user.role, plan: user.plan }, m);
+                const lockSuffix = !access.allowed ? ` · ${m.requiredPlan.toUpperCase()} / Dev Locked` : '';
+                return (
+                  <option key={m.id} value={m.id}>
+                    {m.displayName}{lockSuffix}
+                  </option>
+                );
+              })}
             </select>
           </div>
         </div>
@@ -357,9 +380,15 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                       onChange={(e) => setEditModelId(e.target.value)}
                       className="w-full rounded-lg border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] px-3 py-2 text-xs text-zinc-900 dark:text-white"
                     >
-                      {models.map((m) => (
-                        <option key={m.id} value={m.id}>{m.displayName}</option>
-                      ))}
+                      {models.map((m) => {
+                        const access = canAccessModel({ role: user.role, plan: user.plan }, m);
+                        const lockSuffix = !access.allowed ? ` · ${m.requiredPlan.toUpperCase()} / Dev Locked` : '';
+                        return (
+                          <option key={m.id} value={m.id}>
+                            {m.displayName}{lockSuffix}
+                          </option>
+                        );
+                      })}
                     </select>
                     <textarea
                       rows={3}
@@ -459,38 +488,52 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                                   <FileText className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
                                   <span className="truncate">{pf.name}</span>
                                 </span>
-                                {confirmDeleteFileId === pf.id ? (
-                                  <span className="inline-flex items-center gap-1 shrink-0">
-                                    <button
-                                      type="button"
-                                      onClick={async () => {
-                                        await api.deleteProjectFile(p.id, pf.id);
-                                        setConfirmDeleteFileId(null);
-                                        await loadFiles(p.id);
-                                        onRefresh();
-                                      }}
-                                      className="rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-semibold text-white cursor-pointer"
-                                    >
-                                      Confirm
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => setConfirmDeleteFileId(null)}
-                                      className="rounded border border-zinc-300 dark:border-white/15 px-1.5 py-0.5 text-[10px] text-zinc-500 cursor-pointer"
-                                    >
-                                      Cancel
-                                    </button>
-                                  </span>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    aria-label={`Delete ${pf.name}`}
-                                    onClick={() => setConfirmDeleteFileId(pf.id)}
-                                    className="text-zinc-400 hover:text-red-500 cursor-pointer"
+                                <span className="inline-flex items-center gap-1.5 shrink-0">
+                                  <a
+                                    href={api.getProjectFileDownloadUrl(p.id, pf.id)}
+                                    download={pf.name}
+                                    aria-label={`Download ${pf.name}`}
+                                    className="text-zinc-400 hover:text-emerald-600"
                                   >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
-                                )}
+                                    <Download className="w-3.5 h-3.5" />
+                                  </a>
+                                  {confirmDeleteFileId === pf.id ? (
+                                    <span className="inline-flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={async () => {
+                                          try {
+                                            await api.deleteProjectFile(p.id, pf.id);
+                                            setConfirmDeleteFileId(null);
+                                            await loadFiles(p.id);
+                                            onRefresh();
+                                          } catch (err) {
+                                            setError(err instanceof Error ? err.message : 'Failed to delete project file.');
+                                          }
+                                        }}
+                                        className="rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-semibold text-white cursor-pointer"
+                                      >
+                                        Confirm
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteFileId(null)}
+                                        className="rounded border border-zinc-300 dark:border-white/15 px-1.5 py-0.5 text-[10px] text-zinc-500 cursor-pointer"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </span>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      aria-label={`Delete ${pf.name}`}
+                                      onClick={() => setConfirmDeleteFileId(pf.id)}
+                                      className="text-zinc-400 hover:text-red-500 cursor-pointer"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                </span>
                               </div>
                             ))}
                           </div>
@@ -533,11 +576,15 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                                     <button
                                       type="button"
                                       onClick={async () => {
-                                        await api.deleteMemory(pm.id);
-                                        deleteMemoryFromFirestore(pm.id).catch(() => null);
-                                        setConfirmDeleteMemoryId(null);
-                                        await loadProjectMemories(p.id);
-                                        onRefresh();
+                                        try {
+                                          await api.deleteMemory(pm.id);
+                                          deleteMemoryFromFirestore(pm.id).catch(() => null);
+                                          setConfirmDeleteMemoryId(null);
+                                          await loadProjectMemories(p.id);
+                                          onRefresh();
+                                        } catch (err) {
+                                          setError(err instanceof Error ? err.message : 'Failed to delete project memory.');
+                                        }
                                       }}
                                       className="rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-semibold text-white cursor-pointer"
                                     >
@@ -637,9 +684,13 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                           <button
                             type="button"
                             onClick={async () => {
-                              await api.deleteProject(p.id);
-                              setConfirmDeleteProjectId(null);
-                              onRefresh();
+                              try {
+                                await api.deleteProject(p.id);
+                                setConfirmDeleteProjectId(null);
+                                onRefresh();
+                              } catch (err) {
+                                setError(err instanceof Error ? err.message : 'Failed to delete project.');
+                              }
                             }}
                             className="rounded-xl bg-red-600 px-2.5 py-2 text-xs font-semibold text-white min-h-[40px] cursor-pointer"
                           >

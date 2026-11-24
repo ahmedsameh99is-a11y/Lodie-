@@ -57,8 +57,11 @@ export function classifyProviderError(
     httpStatus === 401 ||
     httpStatus === 403 ||
     lower.includes('api key') ||
+    lower.includes('api-key') ||
+    lower.includes('invalid_api_key') ||
     lower.includes('unauthorized') ||
     lower.includes('invalid key') ||
+    lower.includes('authentication') ||
     lower.includes('permission denied')
   ) {
     return {
@@ -86,6 +89,21 @@ export function classifyProviderError(
   }
 
   if (
+    lower.includes('insufficient_quota') ||
+    lower.includes('credit balance') ||
+    lower.includes('billing hard limit') ||
+    lower.includes('limit: 0') ||
+    (httpStatus !== 429 && (lower.includes('quota') || lower.includes('billing')))
+  ) {
+    return {
+      errorClass: 'quota_exceeded',
+      healthStatus: 'temporarily_unavailable',
+      retryable: false,
+      userMessage: 'Upstream provider quota or billing allowance exhausted.',
+    };
+  }
+
+  if (
     httpStatus === 429 ||
     lower.includes('rate limit') ||
     lower.includes('too many requests') ||
@@ -96,15 +114,6 @@ export function classifyProviderError(
       healthStatus: 'temporarily_unavailable',
       retryable: true,
       userMessage: 'Provider rate limit reached temporarily.',
-    };
-  }
-
-  if (lower.includes('quota') || lower.includes('billing') || lower.includes('insufficient_quota')) {
-    return {
-      errorClass: 'quota_exceeded',
-      healthStatus: 'temporarily_unavailable',
-      retryable: false,
-      userMessage: 'Upstream provider quota or billing allowance exhausted.',
     };
   }
 

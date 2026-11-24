@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { DEFAULT_PLAN_LIMITS } from '../../src/shared/quotas';
 import { db, mapRowToPublicUser, recordAuditLog } from '../db';
-import { type AuthenticatedRequest, getUserQuotaUsage, requireAuth } from '../middleware';
+import { type AuthenticatedRequest, getDetailedUserQuota, requireAuth } from '../middleware';
 import {
   clearSessionCookie,
   createRateLimiter,
@@ -80,7 +80,7 @@ authRouter.post('/register', authLimiter, (req, res) => {
     now
   );
 
-  setSessionCookie(res, id);
+  setSessionCookie(res, id, req);
 
   recordAuditLog({
     actorUserId: id,
@@ -93,9 +93,11 @@ authRouter.post('/register', authLimiter, (req, res) => {
   });
 
   const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as Record<string, unknown>;
+  const publicUser = mapRowToPublicUser(userRow);
+  const { byModelToday: _ignored, ...publicQuota } = getDetailedUserQuota(publicUser);
   res.status(201).json({
-    user: mapRowToPublicUser(userRow),
-    usage: { dailyUsed: 0, monthlyUsed: 0 },
+    user: publicUser,
+    usage: publicQuota,
   });
 });
 
@@ -115,11 +117,12 @@ authRouter.post('/firebase-exchange', authLimiter, async (req, res) => {
   }
 
   const user = upsertUserFromFirebaseIdentity(identity);
-  setSessionCookie(res, user.id);
+  setSessionCookie(res, user.id, req);
 
+  const { byModelToday: _ignored, ...publicQuota } = getDetailedUserQuota(user);
   res.json({
     user,
-    usage: getUserQuotaUsage(user.id),
+    usage: publicQuota,
   });
 });
 
@@ -157,7 +160,7 @@ authRouter.post('/login', authLimiter, (req, res) => {
     ).run('developer', 'developer', devLimits.daily, devLimits.monthly, new Date().toISOString(), userId);
   }
 
-  setSessionCookie(res, userId);
+  setSessionCookie(res, userId, req);
 
   recordAuditLog({
     actorUserId: userId,
@@ -170,14 +173,16 @@ authRouter.post('/login', authLimiter, (req, res) => {
   });
 
   const updatedRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
+  const publicUser = mapRowToPublicUser(updatedRow);
+  const { byModelToday: _ignored, ...publicQuota } = getDetailedUserQuota(publicUser);
   res.json({
-    user: mapRowToPublicUser(updatedRow),
-    usage: getUserQuotaUsage(userId),
+    user: publicUser,
+    usage: publicQuota,
   });
 });
 
 authRouter.post('/logout', (req: AuthenticatedRequest, res) => {
-  clearSessionCookie(res);
+  clearSessionCookie(res, req);
   if (req.authUser) {
     recordAuditLog({
       actorUserId: req.authUser.id,
@@ -197,9 +202,10 @@ authRouter.get('/me', (req: AuthenticatedRequest, res) => {
     res.json({ user: null, usage: null });
     return;
   }
+  const { byModelToday: _ignored, ...publicQuota } = getDetailedUserQuota(req.authUser);
   res.json({
     user: req.authUser,
-    usage: getUserQuotaUsage(req.authUser.id),
+    usage: publicQuota,
   });
 });
 
@@ -347,7 +353,7 @@ authRouter.delete('/account', requireAuth, (req: AuthenticatedRequest, res) => {
   }
 
   db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-  clearSessionCookie(res);
+  clearSessionCookie(res, req);
 
   recordAuditLog({
     actorUserId: null,

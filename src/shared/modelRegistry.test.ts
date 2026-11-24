@@ -36,7 +36,7 @@ const visionModel: BrandedModel = {
   id: 'loody-vision-1',
   displayName: 'LOODY Vision 1',
   tier: 'multimodal',
-  upstreamModelId: 'gemini-4-hydrogen',
+  upstreamModelId: 'gemini-3.1-flash-lite',
   inputModalities: ['text', 'image'],
 };
 
@@ -86,7 +86,7 @@ test('isValidBrandedLineup verifies all 5 required LOODY branded models', () => 
   const full = [
     textOnlyModel,
     { ...textOnlyModel, id: 'sonic-3.5', displayName: 'Sonic 3.5' },
-    { ...textOnlyModel, id: 'lodie-5.5', displayName: 'Lodie 5.5' },
+    { ...textOnlyModel, id: 'lodie-5.5', displayName: 'LOODY 5.5' },
     unconfiguredModel,
     visionModel,
   ];
@@ -132,11 +132,11 @@ test('selectFallbackCandidate skips same failed provider/model alias, unhealthy 
   const failedLodie: BrandedModel = {
     ...textOnlyModel,
     id: 'lodie-5.5',
-    displayName: 'Lodie 5.5',
+    displayName: 'LOODY 5.5',
     tier: 'premium',
     requiredPlan: 'premium',
     provider: 'gemini',
-    upstreamModelId: 'gemini-4-hydrogen',
+    upstreamModelId: 'gemini-3.6-flash',
     availability: 'operational',
   };
   const sameAliasSonic35: BrandedModel = {
@@ -144,7 +144,7 @@ test('selectFallbackCandidate skips same failed provider/model alias, unhealthy 
     id: 'sonic-3.5',
     displayName: 'Sonic 3.5',
     provider: 'gemini',
-    upstreamModelId: 'gemini-4-hydrogen',
+    upstreamModelId: 'gemini-3.6-flash',
     availability: 'operational',
     avgLatencyMs: 500,
   };
@@ -157,7 +157,7 @@ test('selectFallbackCandidate skips same failed provider/model alias, unhealthy 
     availability: 'temporarily_unavailable',
   };
 
-  // Should skip sameAliasSonic35 (same gemini/gemini-4-hydrogen alias) and deadModel, picking sonic-3
+  // Should skip sameAliasSonic35 (same gemini/gemini-3.6-flash alias) and deadModel, picking sonic-3
   const picked = selectFallbackCandidate({
     failedModel: failedLodie,
     allModels: [sameAliasSonic35, deadModel, textOnlyModel],

@@ -22,6 +22,7 @@ import { auth, logoutFirebase, resendVerificationFirebase } from '../lib/firebas
 import { triggerBrowserDownload } from '../shared/chatExport';
 import { t } from '../shared/i18n';
 import type { LoodyLogoVariant } from '../shared/logoGeometry';
+import { canAccessModel } from '../shared/quotas';
 import type {
   AccentColor,
   AppLanguage,
@@ -480,11 +481,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onChange={(e) => handleDefaultModelChange(e.target.value)}
                 className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] px-3 py-2 text-xs text-zinc-900 dark:text-white min-h-[40px]"
               >
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.displayName} ({m.provider})
-                  </option>
-                ))}
+                {models.map((m) => {
+                  const access = user ? canAccessModel({ role: user.role, plan: user.plan }, m) : { allowed: m.requiredPlan === 'free' };
+                  const lockSuffix = !access.allowed ? ` · ${m.requiredPlan.toUpperCase()} / Dev Locked` : '';
+                  return (
+                    <option key={m.id} value={m.id}>
+                      {m.displayName} ({m.provider}){lockSuffix}
+                    </option>
+                  );
+                })}
               </select>
             </div>
 

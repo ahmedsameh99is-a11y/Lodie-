@@ -1,9 +1,15 @@
-import React, { useState } from 'react';
-import { Check, Cpu, Lock, Settings2, Zap, Eye, Sparkles } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Check, Cpu, Lock, Settings2, Zap, Eye, Sparkles, Activity, RotateCcw, ShieldAlert } from 'lucide-react';
 import { api } from '../lib/api';
 import { getModelStatusMeta } from '../shared/modelRegistry';
 import { canAccessModel } from '../shared/quotas';
-import type { BrandedModel, ProviderId, PublicUser } from '../shared/types';
+import type {
+  BrandedModel,
+  MatrixRouteDescriptor,
+  ProviderId,
+  ProviderStatusSummary,
+  PublicUser,
+} from '../shared/types';
 
 interface ModelHubProps {
   user: PublicUser | null;
@@ -29,8 +35,29 @@ export const ModelHub: React.FC<ModelHubProps> = ({
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [checkingAll, setCheckingAll] = useState(false);
+  const [providers, setProviders] = useState<ProviderStatusSummary[]>([]);
+  const [matrix, setMatrix] = useState<Record<string, MatrixRouteDescriptor[]>>({});
+  const [unsupportedNotes, setUnsupportedNotes] = useState<Array<{ provider: string; reason: string }>>([]);
+  const [matrixModelTab, setMatrixModelTab] = useState<string>('sonic-3');
+  const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
 
   const isDeveloper = user?.role === 'developer' || user?.role === 'admin';
+
+  const loadMatrix = async () => {
+    if (!user) return;
+    try {
+      const data = await api.getModelMatrix();
+      setProviders(data.providers);
+      setMatrix(data.matrix);
+      setUnsupportedNotes(data.unsupportedNotes);
+    } catch {
+      // Non-fatal if user lacks session or offline
+    }
+  };
+
+  useEffect(() => {
+    void loadMatrix();
+  }, [user?.id, models.length]);
 
   const startEdit = (m: BrandedModel) => {
     setEditingId(m.id);
@@ -74,8 +101,8 @@ export const ModelHub: React.FC<ModelHubProps> = ({
   };
 
   const tiers: Array<{ key: BrandedModel['tier']; title: string; subtitle: string }> = [
-    { key: 'free', title: 'Free Tier Models', subtitle: 'Fast everyday execution included on all accounts' },
-    { key: 'premium', title: 'Premium Tier Models', subtitle: 'Deep reasoning and editorial intelligence for Premium & Developer accounts' },
+    { key: 'free', title: 'Fast & Balanced Models', subtitle: 'Everyday speed, coding, and tool execution included on all accounts' },
+    { key: 'premium', title: 'Flagship Reasoning & Editorial Models', subtitle: 'Deep reasoning and editorial intelligence included on Free tier (with higher caps on Pro/Max)' },
     { key: 'multimodal', title: 'Multimodal Tier', subtitle: 'Visual and document understanding across images and text' },
   ];
 
@@ -294,6 +321,20 @@ export const ModelHub: React.FC<ModelHubProps> = ({
                               <option value="gemini">gemini</option>
                               <option value="openai-compatible">openai-compatible</option>
                               <option value="anthropic-compatible">anthropic-compatible</option>
+                              <option value="mistral">mistral</option>
+                              <option value="cohere">cohere</option>
+                              <option value="xai">xai</option>
+                              <option value="ai21">ai21</option>
+                              <option value="groq">groq</option>
+                              <option value="cerebras">cerebras</option>
+                              <option value="sambanova">sambanova</option>
+                              <option value="together">together</option>
+                              <option value="fireworks">fireworks</option>
+                              <option value="huggingface">huggingface</option>
+                              <option value="cloudflare">cloudflare</option>
+                              <option value="nvidia">nvidia</option>
+                              <option value="deepinfra">deepinfra</option>
+                              <option value="openrouter">openrouter</option>
                               <option value="hosted-oss">hosted-oss</option>
                             </select>
                           </div>
@@ -365,6 +406,204 @@ export const ModelHub: React.FC<ModelHubProps> = ({
           </section>
         );
       })}
+
+      {user && providers.length > 0 && (
+        <section className="space-y-5 border-t border-zinc-200 dark:border-white/10 pt-8">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="font-display text-lg font-semibold text-zinc-900 dark:text-white flex items-center gap-2">
+                <Activity className="w-4 h-4 text-emerald-500" />
+                <span>Multi-Provider Infrastructure & Compatibility Matrix</span>
+              </h3>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                {providers.filter((p) => p.configured).length}/{providers.length} providers credentialed · Circuit-breaker protected intra-model failover preserves your selected LOODY model.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {models.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => setMatrixModelTab(m.id)}
+                  className={`rounded-lg px-2.5 py-1.5 text-xs font-medium cursor-pointer transition-colors ${
+                    matrixModelTab === m.id
+                      ? 'bg-emerald-600 text-white'
+                      : 'border border-zinc-200 dark:border-white/10 text-zinc-600 dark:text-zinc-300 hover:border-emerald-500/40'
+                  }`}
+                >
+                  {m.displayName}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Selected Branded Model Compatibility Routes */}
+          <div className="rounded-2xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] overflow-hidden">
+            <div className="px-4 py-3 border-b border-zinc-200 dark:border-white/10 flex items-center justify-between text-xs">
+              <span className="font-semibold text-zinc-900 dark:text-white">
+                Compatible Routes for {models.find((m) => m.id === matrixModelTab)?.displayName ?? matrixModelTab}
+              </span>
+              <span className="font-mono text-zinc-500">
+                {(matrix[matrixModelTab] ?? []).length} verified routes
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-zinc-100 dark:border-white/5 text-zinc-500">
+                  <tr>
+                    <th className="py-2.5 px-4 font-medium">#</th>
+                    <th className="py-2.5 px-3 font-medium">Provider</th>
+                    <th className="py-2.5 px-3 font-medium">Upstream Model</th>
+                    <th className="py-2.5 px-3 font-medium">Context</th>
+                    <th className="py-2.5 px-3 font-medium">Capabilities</th>
+                    <th className="py-2.5 px-3 font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-100 dark:divide-white/5">
+                  {(matrix[matrixModelTab] ?? []).map((route) => {
+                    const prov = providers.find((p) => p.id === route.provider);
+                    return (
+                      <tr key={route.id} className="text-zinc-700 dark:text-zinc-300">
+                        <td className="py-2.5 px-4 font-mono text-zinc-500">{route.priority}</td>
+                        <td className="py-2.5 px-3 font-medium">{prov?.displayName ?? route.provider}</td>
+                        <td className="py-2.5 px-3 font-mono text-[11px]">{route.upstreamModelId}</td>
+                        <td className="py-2.5 px-3 font-mono tabular-nums">{route.contextLimit.toLocaleString()}</td>
+                        <td className="py-2.5 px-3 text-[11px] text-zinc-500">
+                          {route.supportsVision ? 'Vision · ' : ''}
+                          {route.supportsTools ? 'Tools · ' : ''}
+                          {route.supportsPromptCaching ? 'Cache · ' : ''}
+                          {route.speedTier}
+                        </td>
+                        <td className="py-2.5 px-3">
+                          {prov?.retired ? (
+                            <span className="text-red-500 font-medium">Unsupported</span>
+                          ) : prov?.configured ? (
+                            <span
+                              className={`font-medium ${
+                                prov.circuitState === 'open'
+                                  ? 'text-red-500'
+                                  : prov.circuitState === 'half_open'
+                                  ? 'text-amber-500'
+                                  : 'text-emerald-600 dark:text-emerald-400'
+                              }`}
+                            >
+                              Configured ({prov.circuitState})
+                            </span>
+                          ) : (
+                            <span className="text-amber-600 dark:text-amber-400">Awaiting credentials</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* All 19 Provider Adapters Readiness & Circuit Status */}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {providers.map((p) => (
+              <div
+                key={p.id}
+                className="rounded-xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-[#0D110F] p-3.5 text-xs space-y-2"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-zinc-900 dark:text-white">{p.displayName}</div>
+                    <div className="font-mono text-[11px] text-zinc-500">
+                      {p.id} · {p.protocol}
+                    </div>
+                  </div>
+                  <span
+                    className={`font-medium whitespace-nowrap ${
+                      p.retired
+                        ? 'text-red-500'
+                        : p.configured && p.circuitState === 'closed'
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : p.circuitState === 'open'
+                        ? 'text-red-500'
+                        : 'text-amber-600 dark:text-amber-400'
+                    }`}
+                  >
+                    {p.retired
+                      ? 'Retired'
+                      : p.configured
+                      ? `Configured (${p.circuitState})`
+                      : 'Awaiting keys'}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-500 font-mono">
+                  <span>Env: {p.envVars.join(', ')}</span>
+                  {p.avgLatencyMs !== null && <span>{p.avgLatencyMs}ms</span>}
+                  <span>Reqs today: {p.todayRequests}/{p.dailyRequestCap}</span>
+                </div>
+                {p.retiredNotice && (
+                  <p className="text-[11px] text-red-500 flex items-start gap-1">
+                    <ShieldAlert className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    <span>{p.retiredNotice}</span>
+                  </p>
+                )}
+                {p.lastError && !p.retired && (
+                  <p className="text-[11px] text-red-500 truncate" title={p.lastError}>
+                    Last error: {p.lastError}
+                  </p>
+                )}
+                {isDeveloper && !p.retired && (
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      disabled={testingProviderId === p.id}
+                      onClick={async () => {
+                        setTestingProviderId(p.id);
+                        try {
+                          const res = await api.testProviderEndpoint(p.id);
+                          setStatusMsg(`${p.displayName}: ${res.testResult.message}`);
+                          await loadMatrix();
+                        } catch (err) {
+                          setStatusMsg(err instanceof Error ? err.message : 'Provider test failed.');
+                        } finally {
+                          setTestingProviderId(null);
+                        }
+                      }}
+                      className="rounded-lg border border-zinc-200 dark:border-white/10 px-2.5 py-1 text-[11px] text-zinc-700 dark:text-zinc-300 hover:border-emerald-500/40 cursor-pointer"
+                    >
+                      {testingProviderId === p.id ? 'Probing...' : 'Probe'}
+                    </button>
+                    {p.circuitState !== 'closed' && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await api.resetProviderCircuitBreaker(p.id);
+                          setStatusMsg(`Circuit breaker reset for ${p.displayName}.`);
+                          await loadMatrix();
+                        }}
+                        className="inline-flex items-center gap-1 rounded-lg border border-amber-500/40 px-2.5 py-1 text-[11px] text-amber-600 dark:text-amber-400 cursor-pointer"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Reset Circuit</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {unsupportedNotes.length > 0 && (
+            <div className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#080B0A] p-4 text-xs space-y-1.5">
+              <div className="font-semibold text-zinc-800 dark:text-zinc-200">
+                Explicitly Excluded / Unsupported Matrix Slots
+              </div>
+              {unsupportedNotes.map((n) => (
+                <div key={n.provider} className="text-zinc-500 dark:text-zinc-400">
+                  <span className="font-mono text-zinc-700 dark:text-zinc-300">{n.provider}:</span> {n.reason}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 };

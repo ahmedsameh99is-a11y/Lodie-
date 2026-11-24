@@ -2,6 +2,7 @@ import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { classifyProviderError } from '../../src/shared/orchestrator';
 import type { AvailabilityStatus, BrandedModel, ChatAttachment, ErrorClass } from '../../src/shared/types';
 import { getModelCredentials } from '../db';
+import { getProviderCatalogEntry, resolveProviderCredentials } from './catalog';
 
 export interface ProviderMessage {
   role: 'user' | 'assistant';
@@ -11,6 +12,7 @@ export interface ProviderMessage {
 
 export interface StreamCallbacks {
   onChunk: (text: string) => void;
+  onFirstToken?: (ttftMs: number) => void;
   onUsage?: (usage: {
     inputTokens?: number;
     outputTokens?: number;
@@ -23,10 +25,19 @@ export class ProviderExecutionError extends Error {
   healthStatus: AvailabilityStatus;
   retryable: boolean;
   httpStatus?: number;
+  retryAfterMs?: number;
+  partialEmitted?: boolean;
 
   constructor(
     message: string,
-    meta: { errorClass: ErrorClass; healthStatus: AvailabilityStatus; retryable: boolean; httpStatus?: number }
+    meta: {
+      errorClass: ErrorClass;
+      healthStatus: AvailabilityStatus;
+      retryable: boolean;
+      httpStatus?: number;
+      retryAfterMs?: number;
+      partialEmitted?: boolean;
+    }
   ) {
     super(message);
     this.name = 'ProviderExecutionError';
@@ -34,7 +45,38 @@ export class ProviderExecutionError extends Error {
     this.healthStatus = meta.healthStatus;
     this.retryable = meta.retryable;
     this.httpStatus = meta.httpStatus;
+    this.retryAfterMs = meta.retryAfterMs;
+    this.partialEmitted = meta.partialEmitted;
   }
+}
+
+export function parseRetryAfterMs(headerVal: string | null | undefined): number | undefined {
+  if (!headerVal || !headerVal.trim()) return undefined;
+  const trimmed = headerVal.trim();
+  const secs = Number(trimmed);
+  if (Number.isFinite(secs) && secs >= 0) {
+    return Math.round(secs * 1000);
+  }
+  const ts = Date.parse(trimmed);
+  if (Number.isFinite(ts)) {
+    return Math.max(0, ts - Date.now());
+  }
+  return undefined;
+}
+
+export function parseRetryAfterFromErrorMessage(message: string): number | undefined {
+  const match = /retry in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i.exec(message);
+  if (match && (match[1] || match[2] || match[3])) {
+    const hours = Number(match[1] ?? 0);
+    const mins = Number(match[2] ?? 0);
+    const secs = Number(match[3] ?? 0);
+    const totalMs = Math.round((hours * 3600 + mins * 60 + secs) * 1000);
+    if (totalMs > 0) return totalMs;
+  }
+  if (/free_tier_requests|limit:\s*20|quota exceeded/i.test(message)) {
+    return 600_000;
+  }
+  return undefined;
 }
 
 export function createGeminiClient(overrideKey?: string): GoogleGenAI | null {
@@ -50,29 +92,24 @@ export function createGeminiClient(overrideKey?: string): GoogleGenAI | null {
   });
 }
 
-function mapThinkingLevel(preset?: BrandedModel['thinkingPreset'], upstreamModelId?: string): ThinkingLevel | undefined {
+function mapThinkingLevel(preset?: BrandedModel['thinkingPreset'], _upstreamModelId?: string): ThinkingLevel | undefined {
   if (!preset) return undefined;
-  const isGemini4 = upstreamModelId?.startsWith('gemini-4-');
   switch (preset) {
     case 'MINIMAL':
-      return isGemini4 ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
+      return ThinkingLevel.MINIMAL;
     case 'LOW':
       return ThinkingLevel.LOW;
     case 'MEDIUM':
       return ThinkingLevel.MEDIUM;
     case 'HIGH':
-      return ThinkingLevel.HIGH;
     case 'XHIGH':
-      if (upstreamModelId === 'gemini-4-hydrogen' || upstreamModelId === 'gemini-4-neon') {
-        return ThinkingLevel.XHIGH;
-      }
       return ThinkingLevel.HIGH;
     default:
       return undefined;
   }
 }
 
-function extractReadableError(err: unknown): { message: string; retryable: boolean; status?: number } {
+export function extractReadableError(err: unknown): { message: string; retryable: boolean; status?: number } {
   const raw = err instanceof Error ? err.message : String(err);
   let status: number | undefined;
   let parsedMsg = raw;
@@ -91,6 +128,8 @@ function extractReadableError(err: unknown): { message: string; retryable: boole
       } catch {
         parsedMsg = inner.message;
       }
+    } else if (typeof first?.message === 'string') {
+      parsedMsg = first.message;
     }
   } catch {
     // Keep raw text
@@ -136,17 +175,16 @@ function normalizeTimeoutOrAbortError(params: {
   timeoutMs: number;
   userSignal?: AbortSignal;
   timeoutSignal?: AbortSignal;
+  partialEmitted?: boolean;
 }): ProviderExecutionError | null {
   if (params.userSignal?.aborted) {
     return null; // Caller intentionally aborted
   }
   const errName = (params.err as { name?: string })?.name;
-  const timedOut =
-    Boolean(params.timeoutSignal?.aborted) ||
-    errName === 'TimeoutError';
+  const timedOut = Boolean(params.timeoutSignal?.aborted) || errName === 'TimeoutError';
 
   if (timedOut) {
-    const secs = Math.round(params.timeoutMs / 1000);
+    const secs = Math.max(1, Math.round(params.timeoutMs / 1000));
     return new ProviderExecutionError(
       `${params.model.displayName} timed out after ${secs}s waiting for ${params.model.provider}/${params.model.upstreamModelId}.`,
       {
@@ -154,6 +192,7 @@ function normalizeTimeoutOrAbortError(params: {
         healthStatus: 'temporarily_unavailable',
         retryable: true,
         httpStatus: 504,
+        partialEmitted: params.partialEmitted,
       }
     );
   }
@@ -186,10 +225,10 @@ export async function generateModelText(params: {
     });
   }
   const timeoutMs = params.timeoutMs ?? 25_000;
-  const requestedModel = params.upstreamModelId ?? 'gemini-4-hydrogen';
+  const requestedModel = params.upstreamModelId ?? 'gemini-3.1-flash-lite';
   const candidates =
-    params.allowFallback !== false && requestedModel === 'gemini-4-hydrogen'
-      ? ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+    params.allowFallback !== false && requestedModel === 'gemini-3.1-flash-lite'
+      ? ['gemini-3.1-flash-lite', 'gemini-3.6-flash']
       : [requestedModel];
   const start = Date.now();
   let lastInfo: { message: string; status?: number; cls: ReturnType<typeof classifyProviderError> } | null = null;
@@ -261,6 +300,72 @@ export async function generateModelText(params: {
   throw new ProviderExecutionError(finalErr.message, { ...finalErr.cls, httpStatus: finalErr.status });
 }
 
+function formatOpenAiContent(m: ProviderMessage): unknown {
+  if (!m.attachments || m.attachments.length === 0) {
+    return m.content;
+  }
+  const parts: Array<Record<string, unknown>> = [];
+  if (m.content) {
+    parts.push({ type: 'text', text: m.content });
+  }
+  for (const att of m.attachments) {
+    parts.push({
+      type: 'image_url',
+      image_url: {
+        url: `data:${att.mimeType};base64,${att.dataBase64}`,
+      },
+    });
+  }
+  return parts;
+}
+
+function formatAnthropicContent(m: ProviderMessage): unknown {
+  if (!m.attachments || m.attachments.length === 0) {
+    return m.content;
+  }
+  const parts: Array<Record<string, unknown>> = [];
+  for (const att of m.attachments) {
+    parts.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: att.mimeType,
+        data: att.dataBase64,
+      },
+    });
+  }
+  if (m.content) {
+    parts.push({ type: 'text', text: m.content });
+  }
+  return parts;
+}
+
+async function readSseLines(
+  body: ReadableStream<Uint8Array>,
+  onLine: (line: string) => void
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      onLine(line);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    for (const line of buffer.split('\n')) {
+      onLine(line);
+    }
+  }
+}
+
 export async function streamModelResponse(params: {
   model: BrandedModel;
   messages: ProviderMessage[];
@@ -273,13 +378,32 @@ export async function streamModelResponse(params: {
   const { model, messages, systemInstruction, signal, callbacks } = params;
   const timeoutMs = Math.min(Math.max(params.timeoutMs ?? 25_000, 1_000), 60_000);
   const maxAttempts = Math.min(Math.max(params.maxAttempts ?? 1, 1), 2);
-  const creds = getModelCredentials(model.id);
+  const storedCreds = getModelCredentials(model.id);
+  const catalogEntry = getProviderCatalogEntry(model.provider);
 
-  // Pre-routing capability validation: never dispatch image payloads to text-only models
-  const hasImages = messages.some((m) => Array.isArray(m.attachments) && m.attachments.length > 0);
-  if (hasImages && !model.inputModalities.includes('image')) {
+  if (!catalogEntry) {
+    throw new ProviderExecutionError(`Unsupported provider: ${model.provider}`, {
+      errorClass: 'configuration_error',
+      healthStatus: 'configuration_error',
+      retryable: false,
+    });
+  }
+
+  if (catalogEntry.retired) {
     throw new ProviderExecutionError(
-      `${model.displayName} does not support image attachments.`,
+      catalogEntry.retiredNotice ?? `${catalogEntry.displayName} is retired and unsupported.`,
+      {
+        errorClass: 'configuration_error',
+        healthStatus: 'configuration_error',
+        retryable: false,
+      }
+    );
+  }
+
+  const hasImages = messages.some((m) => Array.isArray(m.attachments) && m.attachments.length > 0);
+  if (hasImages && (!model.inputModalities.includes('image') || !catalogEntry.supportsVision)) {
+    throw new ProviderExecutionError(
+      `${model.displayName} (${catalogEntry.displayName}) does not support image attachments.`,
       {
         errorClass: 'validation_error',
         healthStatus: model.availability,
@@ -289,8 +413,28 @@ export async function streamModelResponse(params: {
     );
   }
 
-  if (model.provider === 'gemini') {
-    const ai = createGeminiClient(creds.apiKey);
+  const useStoredRowCreds = storedCreds.rowProvider === model.provider;
+  const resolvedCreds = resolveProviderCredentials({
+    provider: model.provider,
+    overrideApiKey: useStoredRowCreds ? storedCreds.apiKey : undefined,
+    hasEncryptedKey: useStoredRowCreds && Boolean(storedCreds.apiKey),
+    customBaseUrl: useStoredRowCreds ? storedCreds.baseUrl : undefined,
+  });
+
+  if (!resolvedCreds.configured) {
+    throw new ProviderExecutionError(
+      `${model.displayName} is awaiting configuration: ${resolvedCreds.missingReason}.`,
+      {
+        errorClass: 'configuration_error',
+        healthStatus: 'awaiting_config',
+        retryable: false,
+      }
+    );
+  }
+
+  // 1. Google Gemini Native SDK Protocol
+  if (catalogEntry.protocol === 'gemini') {
+    const ai = createGeminiClient(resolvedCreds.apiKey);
     if (!ai) {
       throw new ProviderExecutionError(
         `${model.displayName} is awaiting configuration: GEMINI_API_KEY is not configured on the server.`,
@@ -336,6 +480,7 @@ export async function streamModelResponse(params: {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) return;
+      const attemptStart = Date.now();
       let emittedChunk = false;
       const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
       try {
@@ -349,11 +494,12 @@ export async function streamModelResponse(params: {
         });
 
         for await (const chunk of stream) {
-          if (signal?.aborted) {
-            return;
-          }
+          if (signal?.aborted) return;
           if (chunk.text) {
-            emittedChunk = true;
+            if (!emittedChunk) {
+              emittedChunk = true;
+              callbacks.onFirstToken?.(Date.now() - attemptStart);
+            }
             callbacks.onChunk(chunk.text);
           }
           if (chunk.usageMetadata) {
@@ -363,6 +509,13 @@ export async function streamModelResponse(params: {
               cachedTokens: chunk.usageMetadata.cachedContentTokenCount,
             });
           }
+        }
+        if (!emittedChunk && !signal?.aborted) {
+          throw new ProviderExecutionError(`${model.displayName} returned an empty stream response.`, {
+            errorClass: 'provider_unavailable',
+            healthStatus: 'temporarily_unavailable',
+            retryable: true,
+          });
         }
         return;
       } catch (err) {
@@ -374,6 +527,7 @@ export async function streamModelResponse(params: {
           timeoutMs,
           userSignal: signal,
           timeoutSignal,
+          partialEmitted: emittedChunk,
         });
         if (timeoutErr) {
           if (!emittedChunk && attempt < maxAttempts - 1) {
@@ -382,8 +536,17 @@ export async function streamModelResponse(params: {
           }
           throw timeoutErr;
         }
+        if (err instanceof ProviderExecutionError) {
+          err.partialEmitted = emittedChunk;
+          if (!emittedChunk && err.retryable && attempt < maxAttempts - 1) {
+            await sleep(400, signal);
+            continue;
+          }
+          throw err;
+        }
         const info = extractReadableError(err);
         const cls = classifyProviderError(info.message, info.status);
+        const bodyRetryAfter = parseRetryAfterFromErrorMessage(info.message);
         if (!emittedChunk && info.retryable && attempt < maxAttempts - 1) {
           await sleep(400, signal);
           continue;
@@ -392,33 +555,34 @@ export async function streamModelResponse(params: {
           info.status
             ? `${model.displayName} upstream error (${info.status}): ${info.message}`
             : `${model.displayName}: ${info.message}`,
-          { ...cls, httpStatus: info.status }
+          {
+            ...cls,
+            httpStatus: info.status,
+            retryAfterMs: bodyRetryAfter,
+            partialEmitted: emittedChunk,
+          }
         );
       }
     }
     if (lastErr) {
       const info = extractReadableError(lastErr);
       const cls = classifyProviderError(info.message, info.status);
-      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls, httpStatus: info.status });
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, {
+        ...cls,
+        httpStatus: info.status,
+        retryAfterMs: parseRetryAfterFromErrorMessage(info.message),
+      });
     }
     return;
   }
 
-  if (model.provider === 'openai-compatible' || model.provider === 'hosted-oss') {
-    const apiKey =
-      creds.apiKey ??
-      (model.provider === 'hosted-oss' ? process.env.HOSTED_OSS_API_KEY : process.env.OPENAI_API_KEY);
-    const baseUrl =
-      creds.baseUrl ??
-      (model.provider === 'hosted-oss'
-        ? process.env.HOSTED_OSS_BASE_URL
-        : process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1');
-
-    if (!baseUrl || (!apiKey && model.provider === 'openai-compatible')) {
+  // 2. OpenAI-Compatible Protocol (OpenAI, Mistral, xAI, AI21, Groq, Cerebras, SambaNova, Together, Fireworks, HF, Cloudflare, NVIDIA NIM, DeepInfra, Hosted OSS, OpenRouter)
+  if (catalogEntry.protocol === 'openai-compatible') {
+    const baseUrl = resolvedCreds.baseUrl;
+    const apiKey = resolvedCreds.apiKey;
+    if (!baseUrl) {
       throw new ProviderExecutionError(
-        `${model.displayName} is awaiting configuration: requires ${
-          model.provider === 'hosted-oss' ? 'HOSTED_OSS_BASE_URL' : 'OPENAI_API_KEY'
-        }.`,
+        `${model.displayName} is awaiting configuration: ${resolvedCreds.missingReason}.`,
         {
           errorClass: 'configuration_error',
           healthStatus: 'awaiting_config',
@@ -432,23 +596,40 @@ export async function streamModelResponse(params: {
       formattedMessages.push({ role: 'system', content: systemInstruction.trim() });
     }
     for (const m of messages) {
-      formattedMessages.push({ role: m.role, content: m.content });
+      formattedMessages.push({ role: m.role, content: formatOpenAiContent(m) });
     }
 
+    const isOpenAiReasoningModel = /^(o1|o3|o4|gpt-5)(-|$)/.test(model.upstreamModelId);
+    const reasoningEffort =
+      isOpenAiReasoningModel && model.thinkingPreset
+        ? model.thinkingPreset === 'MINIMAL' || model.thinkingPreset === 'LOW'
+          ? 'low'
+          : model.thinkingPreset === 'MEDIUM'
+            ? 'medium'
+            : 'high'
+        : undefined;
+
+    const endpoint = baseUrl.endsWith('/chat/completions')
+      ? baseUrl
+      : `${baseUrl.replace(/\/$/, '')}/chat/completions`;
+
+    const attemptStart = Date.now();
     const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
     let resp: Response;
     try {
-      resp = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      resp = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+          ...(catalogEntry.extraHeaders?.() ?? {}),
         },
         body: JSON.stringify({
           model: model.upstreamModelId,
           messages: formattedMessages,
           stream: true,
-          stream_options: { include_usage: true },
+          ...(catalogEntry.supportsStreamOptionsUsage ? { stream_options: { include_usage: true } } : {}),
+          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
         }),
         signal: attemptSignal,
       });
@@ -464,23 +645,25 @@ export async function streamModelResponse(params: {
       if (timeoutErr) throw timeoutErr;
       const info = extractReadableError(err);
       const cls = classifyProviderError(info.message);
-      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
+      throw new ProviderExecutionError(`${model.displayName} (${catalogEntry.displayName}): ${info.message}`, { ...cls });
     }
 
     if (!resp.ok || !resp.body) {
+      const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'));
       const errText = await resp.text().catch(() => resp.statusText);
       const info = extractReadableError(errText);
       const cls = classifyProviderError(info.message || errText, resp.status);
-      throw new ProviderExecutionError(`${model.displayName} upstream error (${resp.status}): ${info.message || errText}`, {
-        ...cls,
-        httpStatus: resp.status,
-      });
+      throw new ProviderExecutionError(
+        `${model.displayName} (${catalogEntry.displayName}) upstream error (${resp.status}): ${info.message || errText}`,
+        {
+          ...cls,
+          httpStatus: resp.status,
+          retryAfterMs,
+        }
+      );
     }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
+    let emittedChunk = false;
     const processOpenAiLine = (line: string) => {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) return;
@@ -495,11 +678,26 @@ export async function streamModelResponse(params: {
       if (parsed.error) {
         const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
         const cls = classifyProviderError(msg);
-        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls });
+        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls, partialEmitted: emittedChunk });
       }
       const delta = parsed.choices?.[0]?.delta?.content;
       if (typeof delta === 'string' && delta.length > 0) {
+        if (!emittedChunk) {
+          emittedChunk = true;
+          callbacks.onFirstToken?.(Date.now() - attemptStart);
+        }
         callbacks.onChunk(delta);
+      } else if (Array.isArray(delta)) {
+        const combined = delta
+          .map((item) => (typeof item?.text === 'string' ? item.text : ''))
+          .join('');
+        if (combined.length > 0) {
+          if (!emittedChunk) {
+            emittedChunk = true;
+            callbacks.onFirstToken?.(Date.now() - attemptStart);
+          }
+          callbacks.onChunk(combined);
+        }
       }
       if (parsed.usage) {
         callbacks.onUsage?.({
@@ -511,43 +709,47 @@ export async function streamModelResponse(params: {
     };
 
     try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          processOpenAiLine(line);
-        }
-      }
-      buffer += decoder.decode();
-      if (buffer.trim()) {
-        for (const line of buffer.split('\n')) {
-          processOpenAiLine(line);
-        }
-      }
+      await readSseLines(resp.body, processOpenAiLine);
     } catch (err) {
       if (signal?.aborted) return;
-      if (err instanceof ProviderExecutionError) throw err;
+      if (err instanceof ProviderExecutionError) {
+        err.partialEmitted = emittedChunk;
+        throw err;
+      }
       const timeoutErr = normalizeTimeoutOrAbortError({
         err,
         model,
         timeoutMs,
         userSignal: signal,
         timeoutSignal,
+        partialEmitted: emittedChunk,
       });
       if (timeoutErr) throw timeoutErr;
       const info = extractReadableError(err);
       const cls = classifyProviderError(info.message);
-      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, {
+        ...cls,
+        partialEmitted: emittedChunk,
+      });
+    }
+
+    if (!emittedChunk && !signal?.aborted) {
+      throw new ProviderExecutionError(
+        `${model.displayName} (${catalogEntry.displayName}) returned an empty probe response.`,
+        {
+          errorClass: 'provider_unavailable',
+          healthStatus: 'temporarily_unavailable',
+          retryable: true,
+        }
+      );
     }
     return;
   }
 
-  if (model.provider === 'anthropic-compatible') {
-    const apiKey = creds.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    const baseUrl = creds.baseUrl ?? 'https://api.anthropic.com';
+  // 3. Anthropic Messages API Protocol (with Prompt Caching & Multimodal Image Support)
+  if (catalogEntry.protocol === 'anthropic') {
+    const apiKey = resolvedCreds.apiKey;
+    const baseUrl = resolvedCreds.baseUrl ?? 'https://api.anthropic.com';
     if (!apiKey) {
       throw new ProviderExecutionError(
         `${model.displayName} is awaiting configuration: requires ANTHROPIC_API_KEY.`,
@@ -559,6 +761,14 @@ export async function streamModelResponse(params: {
       );
     }
 
+    const trimmedSystem = systemInstruction?.trim() || '';
+    const systemField = !trimmedSystem
+      ? undefined
+      : trimmedSystem.length >= 1024
+        ? [{ type: 'text', text: trimmedSystem, cache_control: { type: 'ephemeral' } }]
+        : trimmedSystem;
+
+    const attemptStart = Date.now();
     const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
     let resp: Response;
     try {
@@ -572,9 +782,9 @@ export async function streamModelResponse(params: {
         body: JSON.stringify({
           model: model.upstreamModelId,
           max_tokens: 4096,
-          system: systemInstruction?.trim() || undefined,
+          system: systemField,
           stream: true,
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          messages: messages.map((m) => ({ role: m.role, content: formatAnthropicContent(m) })),
         }),
         signal: attemptSignal,
       });
@@ -594,6 +804,7 @@ export async function streamModelResponse(params: {
     }
 
     if (!resp.ok || !resp.body) {
+      const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'));
       const errText = await resp.text().catch(() => resp.statusText);
       const info = extractReadableError(errText);
       const cls = classifyProviderError(info.message || errText, resp.status);
@@ -602,15 +813,15 @@ export async function streamModelResponse(params: {
         {
           ...cls,
           httpStatus: resp.status,
+          retryAfterMs,
         }
       );
     }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
     let inputTokens = 0;
     let outputTokens = 0;
+    let cachedTokens = 0;
+    let emittedChunk = false;
 
     const processAnthropicLine = (line: string) => {
       const trimmed = line.trim();
@@ -626,40 +837,115 @@ export async function streamModelResponse(params: {
       if (parsed.type === 'error' && parsed.error) {
         const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
         const cls = classifyProviderError(msg);
-        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls });
+        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls, partialEmitted: emittedChunk });
       }
-      if (parsed.type === 'message_start' && parsed.message?.usage?.input_tokens) {
-        inputTokens = parsed.message.usage.input_tokens;
+      if (parsed.type === 'message_start' && parsed.message?.usage) {
+        inputTokens = Number(parsed.message.usage.input_tokens ?? inputTokens);
+        cachedTokens = Number(parsed.message.usage.cache_read_input_tokens ?? cachedTokens);
       }
       if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+        if (!emittedChunk) {
+          emittedChunk = true;
+          callbacks.onFirstToken?.(Date.now() - attemptStart);
+        }
         callbacks.onChunk(parsed.delta.text);
       }
-      if (parsed.type === 'message_delta' && parsed.usage?.output_tokens) {
-        outputTokens = parsed.usage.output_tokens;
-        callbacks.onUsage?.({ inputTokens, outputTokens, cachedTokens: 0 });
+      if (parsed.type === 'message_delta' && parsed.usage) {
+        if (parsed.usage.input_tokens !== undefined) {
+          inputTokens = Number(parsed.usage.input_tokens);
+        }
+        if (parsed.usage.cache_read_input_tokens !== undefined) {
+          cachedTokens = Number(parsed.usage.cache_read_input_tokens);
+        }
+        if (parsed.usage.output_tokens !== undefined) {
+          outputTokens = Number(parsed.usage.output_tokens);
+        }
+        callbacks.onUsage?.({ inputTokens, outputTokens, cachedTokens });
       }
     };
 
     try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          processAnthropicLine(line);
-        }
-      }
-      buffer += decoder.decode();
-      if (buffer.trim()) {
-        for (const line of buffer.split('\n')) {
-          processAnthropicLine(line);
-        }
-      }
+      await readSseLines(resp.body, processAnthropicLine);
     } catch (err) {
       if (signal?.aborted) return;
-      if (err instanceof ProviderExecutionError) throw err;
+      if (err instanceof ProviderExecutionError) {
+        err.partialEmitted = emittedChunk;
+        throw err;
+      }
+      const timeoutErr = normalizeTimeoutOrAbortError({
+        err,
+        model,
+        timeoutMs,
+        userSignal: signal,
+        timeoutSignal,
+        partialEmitted: emittedChunk,
+      });
+      if (timeoutErr) throw timeoutErr;
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message);
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, {
+        ...cls,
+        partialEmitted: emittedChunk,
+      });
+    }
+
+    if (!emittedChunk && !signal?.aborted) {
+      throw new ProviderExecutionError(`${model.displayName} (Anthropic) returned an empty response.`, {
+        errorClass: 'provider_unavailable',
+        healthStatus: 'temporarily_unavailable',
+        retryable: true,
+      });
+    }
+    return;
+  }
+
+  // 4. Cohere v2 Native Streaming Protocol (/v2/chat)
+  if (catalogEntry.protocol === 'cohere-v2') {
+    const apiKey = resolvedCreds.apiKey;
+    const baseUrl = resolvedCreds.baseUrl ?? 'https://api.cohere.com';
+    if (!apiKey) {
+      throw new ProviderExecutionError(
+        `${model.displayName} is awaiting configuration: requires COHERE_API_KEY.`,
+        {
+          errorClass: 'configuration_error',
+          healthStatus: 'awaiting_config',
+          retryable: false,
+        }
+      );
+    }
+
+    const cohereMessages: Array<{ role: string; content: string }> = [];
+    if (systemInstruction?.trim()) {
+      cohereMessages.push({ role: 'system', content: systemInstruction.trim() });
+    }
+    for (const m of messages) {
+      cohereMessages.push({ role: m.role, content: m.content });
+    }
+
+    const endpoint = baseUrl.endsWith('/v2/chat')
+      ? baseUrl
+      : `${baseUrl.replace(/\/$/, '')}/v2/chat`;
+
+    const attemptStart = Date.now();
+    const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
+    let resp: Response;
+    try {
+      resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: model.upstreamModelId,
+          stream: true,
+          messages: cohereMessages,
+        }),
+        signal: attemptSignal,
+      });
+    } catch (err) {
+      if (signal?.aborted) return;
       const timeoutErr = normalizeTimeoutOrAbortError({
         err,
         model,
@@ -670,36 +956,169 @@ export async function streamModelResponse(params: {
       if (timeoutErr) throw timeoutErr;
       const info = extractReadableError(err);
       const cls = classifyProviderError(info.message);
-      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, { ...cls });
+      throw new ProviderExecutionError(`${model.displayName} (Cohere): ${info.message}`, { ...cls });
+    }
+
+    if (!resp.ok || !resp.body) {
+      const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'));
+      const errText = await resp.text().catch(() => resp.statusText);
+      const info = extractReadableError(errText);
+      const cls = classifyProviderError(info.message || errText, resp.status);
+      throw new ProviderExecutionError(
+        `${model.displayName} (Cohere) upstream error (${resp.status}): ${info.message || errText}`,
+        {
+          ...cls,
+          httpStatus: resp.status,
+          retryAfterMs,
+        }
+      );
+    }
+
+    let emittedChunk = false;
+    const processCohereLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const dataStr = trimmed.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') return;
+      let parsed: Record<string, any>;
+      try {
+        parsed = JSON.parse(dataStr) as Record<string, any>;
+      } catch {
+        return;
+      }
+      if (parsed.type === 'error' || parsed.message?.includes?.('error')) {
+        if (parsed.error) {
+          const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
+          const cls = classifyProviderError(msg);
+          throw new ProviderExecutionError(`${model.displayName}: ${msg}`, {
+            ...cls,
+            partialEmitted: emittedChunk,
+          });
+        }
+      }
+      if (parsed.type === 'content-delta') {
+        const text = parsed.delta?.message?.content?.text;
+        if (typeof text === 'string' && text.length > 0) {
+          if (!emittedChunk) {
+            emittedChunk = true;
+            callbacks.onFirstToken?.(Date.now() - attemptStart);
+          }
+          callbacks.onChunk(text);
+        }
+      }
+      if (parsed.type === 'message-end' && parsed.delta?.usage) {
+        const tok = parsed.delta.usage.tokens ?? parsed.delta.usage.billed_units;
+        if (tok) {
+          callbacks.onUsage?.({
+            inputTokens: Number(tok.input_tokens ?? 0),
+            outputTokens: Number(tok.output_tokens ?? 0),
+            cachedTokens: 0,
+          });
+        }
+      }
+    };
+
+    try {
+      await readSseLines(resp.body, processCohereLine);
+    } catch (err) {
+      if (signal?.aborted) return;
+      if (err instanceof ProviderExecutionError) {
+        err.partialEmitted = emittedChunk;
+        throw err;
+      }
+      const timeoutErr = normalizeTimeoutOrAbortError({
+        err,
+        model,
+        timeoutMs,
+        userSignal: signal,
+        timeoutSignal,
+        partialEmitted: emittedChunk,
+      });
+      if (timeoutErr) throw timeoutErr;
+      const info = extractReadableError(err);
+      const cls = classifyProviderError(info.message);
+      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, {
+        ...cls,
+        partialEmitted: emittedChunk,
+      });
+    }
+
+    if (!emittedChunk && !signal?.aborted) {
+      throw new ProviderExecutionError(`${model.displayName} (Cohere) returned an empty response.`, {
+        errorClass: 'provider_unavailable',
+        healthStatus: 'temporarily_unavailable',
+        retryable: true,
+      });
     }
     return;
   }
 
-  throw new ProviderExecutionError(`Unsupported provider: ${model.provider}`, {
+  throw new ProviderExecutionError(`Unsupported provider protocol: ${catalogEntry.protocol}`, {
     errorClass: 'configuration_error',
     healthStatus: 'configuration_error',
     retryable: false,
   });
 }
 
-export async function testProviderConnection(model: BrandedModel): Promise<{
+// Valid 1x1 emerald PNG for multimodal connectivity & image-format verification
+const PROBE_1X1_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAEBgIApD5fRAAAAABJRU5ErkJggg==';
+
+export async function testProviderConnection(
+  model: BrandedModel,
+  options?: { prompt?: string; testImage?: boolean; timeoutMs?: number }
+): Promise<{
   ok: boolean;
   latencyMs: number;
+  ttftMs: number | null;
+  httpStatus: number | null;
   healthStatus: AvailabilityStatus;
   errorClass: ErrorClass | null;
+  retryAfterMs?: number;
   message: string;
+  sampleText?: string;
+  usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number };
 }> {
   const start = Date.now();
+  let ttftMs: number | null = null;
+  let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } | undefined;
+  let sampleText = '';
+
+  const probeModel: BrandedModel = {
+    ...model,
+    thinkingPreset: 'MINIMAL',
+  };
+
   try {
-    let sampleText = '';
     await streamModelResponse({
-      model,
-      timeoutMs: 10_000,
-      maxAttempts: 1,
-      messages: [{ role: 'user', content: 'Respond with exactly: OK' }],
+      model: probeModel,
+      timeoutMs: options?.timeoutMs ?? 35_000,
+      maxAttempts: 2,
+      messages: [
+        {
+          role: 'user',
+          content: options?.prompt ?? 'Respond with exactly: OK',
+          attachments: options?.testImage
+            ? [
+                {
+                  mimeType: 'image/png',
+                  dataBase64: PROBE_1X1_PNG_BASE64,
+                  name: 'probe.png',
+                  sizeBytes: 68,
+                },
+              ]
+            : undefined,
+        },
+      ],
       callbacks: {
+        onFirstToken: (ms) => {
+          ttftMs = ms;
+        },
         onChunk: (text) => {
           sampleText += text;
+        },
+        onUsage: (u) => {
+          usage = u;
         },
       },
     });
@@ -714,11 +1133,15 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
     return {
       ok,
       latencyMs,
+      ttftMs,
+      httpStatus: ok ? 200 : null,
       healthStatus,
       errorClass: ok ? null : 'provider_unavailable',
       message: ok
         ? `Verified live response from ${model.provider}/${model.upstreamModelId} (${latencyMs}ms)`
         : `${model.displayName} returned an empty probe response.`,
+      sampleText: sampleText.trim().slice(0, 400),
+      usage,
     };
   } catch (err) {
     const latencyMs = Date.now() - start;
@@ -731,8 +1154,11 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
       return {
         ok: false,
         latencyMs,
+        ttftMs,
+        httpStatus: err.httpStatus ?? null,
         healthStatus: failedStatus,
         errorClass: err.errorClass,
+        retryAfterMs: err.retryAfterMs,
         message: err.message,
       };
     }
@@ -741,6 +1167,8 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
     return {
       ok: false,
       latencyMs,
+      ttftMs,
+      httpStatus: null,
       healthStatus:
         cls.healthStatus === 'slow' || cls.healthStatus === 'operational' || cls.healthStatus === 'connected'
           ? 'temporarily_unavailable'
@@ -750,3 +1178,4 @@ export async function testProviderConnection(model: BrandedModel): Promise<{
     };
   }
 }
+

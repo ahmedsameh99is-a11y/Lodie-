@@ -100,6 +100,10 @@ export const FilesView: React.FC<FilesViewProps> = ({ user, onUseInChat, onOpenA
       setError('Executable binaries (.exe, .bat, .dll, .apk, etc.) are blocked for workspace security.');
       return;
     }
+    if (file.size === 0) {
+      setError('Empty (0-byte) files cannot be uploaded.');
+      return;
+    }
     if (file.size > 5_000_000) {
       setError('Workspace files must be under 5 MB.');
       return;

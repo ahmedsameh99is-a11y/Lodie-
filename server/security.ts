@@ -133,20 +133,61 @@ export function parseCookies(req: Request): Record<string, string> {
   return result;
 }
 
-export function setSessionCookie(res: Response, userId: string): void {
+export function isHttpsRequest(req?: Request): boolean {
+  if (req) {
+    if (req.secure) return true;
+    const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+    if (forwardedProto === 'https') return true;
+    if (forwardedProto === 'http') return false;
+  }
+  return process.env.NODE_ENV === 'production';
+}
+
+function appendPartitionedAttribute(res: Response): void {
+  const existing = res.getHeader('Set-Cookie');
+  if (!existing) return;
+  const list = Array.isArray(existing) ? existing.map(String) : [String(existing)];
+  const updated = list.map((cookieStr) => {
+    if (
+      cookieStr.startsWith(`${SESSION_COOKIE_NAME}=`) &&
+      !/;\s*partitioned\b/i.test(cookieStr)
+    ) {
+      return `${cookieStr}; Partitioned`;
+    }
+    return cookieStr;
+  });
+  res.setHeader('Set-Cookie', updated.length === 1 ? updated[0] : updated);
+}
+
+export function setSessionCookie(res: Response, userId: string, req?: Request): void {
   const token = signSessionCookie(userId);
-  const isProd = process.env.NODE_ENV === 'production';
+  const https = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: isProd,
+    sameSite: https ? 'none' : 'lax',
+    secure: https,
     path: '/',
     maxAge: 1000 * 60 * 60 * 24 * 7,
   });
+  if (https) {
+    appendPartitionedAttribute(res);
+  }
 }
 
-export function clearSessionCookie(res: Response): void {
-  res.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
+export function clearSessionCookie(res: Response, req?: Request): void {
+  const https = isHttpsRequest(req);
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: https ? 'none' : 'lax',
+    secure: https,
+    path: '/',
+  });
+  if (https) {
+    appendPartitionedAttribute(res);
+  }
 }
 
 export function isDeveloperAllowlisted(email: string): boolean {
@@ -314,15 +355,101 @@ export function inspectUploadedBinarySafety(params: {
   return { safe: true };
 }
 
+export function validateImageAttachmentBinary(params: {
+  mimeType: string;
+  dataBase64: string;
+  name: string;
+}): { valid: boolean; reason?: string } {
+  const cleaned = params.dataBase64.replace(/\s+/g, '');
+  if (!cleaned || cleaned.length < 8 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
+    return { valid: false, reason: `Image attachment "${params.name}" contains malformed base64 data.` };
+  }
+  const buffer = Buffer.from(cleaned, 'base64');
+  if (buffer.length < 8) {
+    return { valid: false, reason: `Image attachment "${params.name}" is truncated or too small.` };
+  }
+  const execCheck = detectDisallowedExecutableMagic(buffer);
+  if (execCheck.blocked) {
+    return { valid: false, reason: execCheck.reason };
+  }
+
+  if (params.mimeType === 'image/png') {
+    const isPng =
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47 &&
+      buffer[4] === 0x0d &&
+      buffer[5] === 0x0a &&
+      buffer[6] === 0x1a &&
+      buffer[7] === 0x0a;
+    return isPng
+      ? { valid: true }
+      : { valid: false, reason: `Image "${params.name}" failed PNG magic-byte verification.` };
+  }
+
+  if (params.mimeType === 'image/jpeg') {
+    const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    return isJpeg
+      ? { valid: true }
+      : { valid: false, reason: `Image "${params.name}" failed JPEG magic-byte verification.` };
+  }
+
+  if (params.mimeType === 'image/gif') {
+    const sig = buffer.subarray(0, 6).toString('ascii');
+    const isGif = sig === 'GIF87a' || sig === 'GIF89a';
+    return isGif
+      ? { valid: true }
+      : { valid: false, reason: `Image "${params.name}" failed GIF magic-byte verification.` };
+  }
+
+  if (params.mimeType === 'image/webp') {
+    const isWebp =
+      buffer.length >= 12 &&
+      buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+    return isWebp
+      ? { valid: true }
+      : { valid: false, reason: `Image "${params.name}" failed WebP magic-byte verification.` };
+  }
+
+  return { valid: false, reason: `Unsupported image MIME type: ${params.mimeType}` };
+}
+
 export function createRateLimiter(options: {
   windowMs: number;
   maxRequests: number;
   scope: string;
 }) {
   const hits = new Map<string, number[]>();
+  let lastPrunedAt = Date.now();
+  const MAX_TRACKED_KEYS = 5_000;
+
   return (req: Request, res: Response, next: NextFunction) => {
     const now = Date.now();
     const cutoff = now - options.windowMs;
+
+    if (now - lastPrunedAt >= Math.max(30_000, options.windowMs) || hits.size >= MAX_TRACKED_KEYS) {
+      lastPrunedAt = now;
+      for (const [k, timestamps] of hits.entries()) {
+        const fresh = timestamps.filter((ts) => ts > cutoff);
+        if (fresh.length === 0) {
+          hits.delete(k);
+        } else {
+          hits.set(k, fresh);
+        }
+      }
+      if (hits.size > MAX_TRACKED_KEYS) {
+        const excess = hits.size - MAX_TRACKED_KEYS;
+        let removed = 0;
+        for (const k of hits.keys()) {
+          hits.delete(k);
+          removed++;
+          if (removed >= excess) break;
+        }
+      }
+    }
+
     const identity = (req as Request & { authUser?: { id: string } }).authUser?.id ?? req.ip ?? 'anon';
     const key = `${options.scope}:${identity}`;
     const existing = (hits.get(key) ?? []).filter((ts) => ts > cutoff);

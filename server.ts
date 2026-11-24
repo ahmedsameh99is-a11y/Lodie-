@@ -1,4 +1,5 @@
 import 'dotenv/config';
+process.env.LOODY_SERVER_RUNTIME = '1';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';

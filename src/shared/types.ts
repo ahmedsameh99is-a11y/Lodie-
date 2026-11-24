@@ -5,7 +5,79 @@ export type AppTheme = 'dark' | 'light' | 'system';
 export type AccentColor = 'emerald' | 'teal' | 'mint' | 'slate';
 export type FontSizePref = 'sm' | 'md' | 'lg';
 export type DensityPref = 'comfortable' | 'compact';
-export type ProviderId = 'gemini' | 'openai-compatible' | 'anthropic-compatible' | 'hosted-oss';
+export type ProviderId =
+  | 'gemini'
+  | 'mistral'
+  | 'cohere'
+  | 'xai'
+  | 'ai21'
+  | 'groq'
+  | 'cerebras'
+  | 'sambanova'
+  | 'together'
+  | 'fireworks'
+  | 'github-models'
+  | 'huggingface'
+  | 'cloudflare'
+  | 'nvidia'
+  | 'deepinfra'
+  | 'openai-compatible'
+  | 'anthropic-compatible'
+  | 'hosted-oss'
+  | 'openrouter';
+
+export type ProviderProtocol = 'gemini' | 'openai-compatible' | 'anthropic' | 'cohere-v2';
+
+export type CircuitState = 'closed' | 'open' | 'half_open';
+
+export type ProviderCredentialStatus =
+  | 'configured'
+  | 'awaiting_credentials'
+  | 'retired_unsupported';
+
+export interface ProviderStatusSummary {
+  id: ProviderId;
+  displayName: string;
+  protocol: ProviderProtocol;
+  credentialStatus: ProviderCredentialStatus;
+  configured: boolean;
+  retired: boolean;
+  retiredNotice?: string;
+  envVars: string[];
+  defaultBaseUrl: string;
+  supportsVision: boolean;
+  supportsStreaming: boolean;
+  supportsPromptCaching: boolean;
+  circuitState: CircuitState;
+  consecutiveFailures: number;
+  avgLatencyMs: number | null;
+  lastErrorClass: ErrorClass | null;
+  lastError: string | null;
+  cooldownUntil: string | null;
+  todaySpendUsd: number;
+  todayRequests: number;
+  dailyBudgetUsd: number;
+  dailyRequestCap: number;
+}
+
+export interface MatrixRouteDescriptor {
+  id: string;
+  brandedModelId: string;
+  provider: ProviderId;
+  upstreamModelId: string;
+  priority: number;
+  contextLimit: number;
+  supportsVision: boolean;
+  supportsTools: boolean;
+  supportsStreaming: boolean;
+  supportsPromptCaching: boolean;
+  costTier: 'free' | 'low' | 'balanced' | 'premium';
+  speedTier: 'ultra_fast' | 'fast' | 'balanced' | 'deep';
+  arabicStrength: 'high' | 'medium' | 'standard';
+  taskAffinities: OrchestratorMode[];
+  notes?: string;
+}
+
 export type ModelTier = 'free' | 'premium' | 'multimodal';
 export type AvailabilityStatus =
   | 'operational'
@@ -204,6 +276,7 @@ export interface ChatMessage {
   citations?: KnowledgeCitation[];
   modelId?: string;
   provider?: ProviderId;
+  upstreamModelId?: string;
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
@@ -222,11 +295,23 @@ export interface ConversationShare {
   updatedAt: string;
 }
 
+export interface PerModelDailyQuotaEntry {
+  modelId: string;
+  used: number;
+  limit: number;
+  remaining: number;
+}
+
 export interface TokenUsageSummary {
   dailyUsed: number;
   dailyLimit: number;
+  dailyRemaining?: number;
   monthlyUsed: number;
   monthlyLimit: number;
+  monthlyRemaining?: number;
+  dailyResetAtUtc?: string;
+  monthlyResetAtUtc?: string;
+  perModelDaily?: PerModelDailyQuotaEntry[];
   providerReportedTotal: number;
   estimatedTotal: number;
   estimatedCostUsd: number;

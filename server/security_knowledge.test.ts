@@ -1,15 +1,39 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test, { after, before } from 'node:test';
+import type Database from 'better-sqlite3';
 import JSZip from 'jszip';
 import * as XLSX from 'xlsx';
-import { extractDocumentContent } from './knowledge';
 import {
   assertSafeExternalUrl,
   detectDisallowedExecutableMagic,
   inspectUploadedBinarySafety,
   isPrivateOrReservedIp,
   validateExternalHttpUrl,
+  validateImageAttachmentBinary,
 } from './security';
+
+let db: Database.Database;
+let tempDbPath = '';
+let extractDocumentContent: typeof import('./knowledge').extractDocumentContent;
+
+before(async () => {
+  tempDbPath = path.join(os.tmpdir(), `loody-sec-knowledge-${process.pid}-${Date.now()}.db`);
+  process.env.LOODY_DB_PATH = tempDbPath;
+  const dbMod = await import('./db');
+  db = dbMod.db;
+  const knowledgeMod = await import('./knowledge');
+  extractDocumentContent = knowledgeMod.extractDocumentContent;
+});
+
+after(() => {
+  db.close();
+  for (const ext of ['', '-wal', '-shm']) {
+    fs.rmSync(`${tempDbPath}${ext}`, { force: true });
+  }
+});
 
 function buildMinimalValidPdf(text: string): Buffer {
   const escaped = text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
@@ -113,6 +137,65 @@ test('Executable magic-byte & spoofed MIME detection blocks disguised binaries s
       buffer: Buffer.from('# LOODY Architecture Notes\nClean plain markdown.', 'utf8'),
     }).safe,
     true
+  );
+
+  // Strict chat image attachment magic-byte verification
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'ok.png',
+      mimeType: 'image/png',
+      dataBase64: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]).toString('base64'),
+    }).valid,
+    true
+  );
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'ok.jpg',
+      mimeType: 'image/jpeg',
+      dataBase64: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]).toString('base64'),
+    }).valid,
+    true
+  );
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'ok.gif',
+      mimeType: 'image/gif',
+      dataBase64: Buffer.from('GIF89a\x01\x00\x01\x00', 'ascii').toString('base64'),
+    }).valid,
+    true
+  );
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'ok.webp',
+      mimeType: 'image/webp',
+      dataBase64: Buffer.from('RIFF\x10\x00\x00\x00WEBP', 'ascii').toString('base64'),
+    }).valid,
+    true
+  );
+  // Spoofed/mismatched/truncated images fail
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'malware.png',
+      mimeType: 'image/png',
+      dataBase64: Buffer.from([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00]).toString('base64'),
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'png-as-jpg.jpg',
+      mimeType: 'image/jpeg',
+      dataBase64: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64'),
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateImageAttachmentBinary({
+      name: 'corrupt.png',
+      mimeType: 'image/png',
+      dataBase64: '!!!not-base64!!!',
+    }).valid,
+    false
   );
 });
 
