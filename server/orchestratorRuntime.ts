@@ -179,7 +179,9 @@ export function buildProviderSnapshots(params?: {
       defaultBaseUrl: entry.defaultBaseUrl,
       supportsVision: entry.supportsVision,
       supportsStreaming: entry.supportsStreaming,
+      supportsTools: entry.supportsTools,
       supportsPromptCaching: entry.supportsPromptCaching,
+      isGateway: entry.isGateway,
       circuitState: circuitCheck.state,
       consecutiveFailures: rec.consecutiveFailures,
       avgLatencyMs: rec.avgLatencyMs,
@@ -366,6 +368,7 @@ export async function orchestrateChatStream(params: {
               params.callbacks.onChunk(chunk);
             },
             onUsage: params.callbacks.onUsage,
+            onProviderMeta: params.callbacks.onProviderMeta,
           },
         });
       } finally {

@@ -113,7 +113,12 @@ billingRouter.get('/summary', (req: AuthenticatedRequest, res) => {
         id: String(r.id),
         modelId: String(r.model_id),
         provider: r.provider,
+        upstreamModelId: r.upstream_model_id ? String(r.upstream_model_id) : undefined,
+        upstreamAttribution: r.upstream_attribution ? String(r.upstream_attribution) : undefined,
         taskType: r.task_type ? String(r.task_type) : 'chat',
+        latencyMs: r.latency_ms !== null && r.latency_ms !== undefined ? Number(r.latency_ms) : null,
+        fallbackAttempts:
+          r.fallback_attempts !== null && r.fallback_attempts !== undefined ? Number(r.fallback_attempts) : 1,
         inputTokens: Number(r.input_tokens),
         outputTokens: Number(r.output_tokens),
         cachedTokens: Number(r.cached_tokens),

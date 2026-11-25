@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Globe, Search, Trash2, ExternalLink, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { api } from '../lib/api';
+import { toSafeHref } from '../shared/safeUrl';
 import type { Project, PublicUser, ResearchReport } from '../shared/types';
 
 interface ResearchViewProps {
@@ -284,22 +285,37 @@ export const ResearchView: React.FC<ResearchViewProps> = ({ user, projects, onOp
                 <div className="space-y-2">
                   <div className="font-semibold text-zinc-800 dark:text-zinc-200">Verified Citations ({activeReport.sources.length})</div>
                   <div className="grid gap-2 sm:grid-cols-2">
-                    {activeReport.sources.map((src, i) => (
-                      <a
-                        key={i}
-                        href={src.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="rounded-xl border border-emerald-500/20 bg-zinc-50 dark:bg-[#050706] p-3 hover:border-emerald-500/50 transition-colors space-y-1 block"
-                      >
-                        <div className="flex items-center justify-between gap-1 text-emerald-600 dark:text-emerald-400 font-semibold">
-                          <span className="truncate">{src.title}</span>
-                          <ExternalLink className="w-3 h-3 shrink-0" />
+                    {activeReport.sources.map((src, i) => {
+                      const safeHref = toSafeHref(src.url);
+                      const cardBody = (
+                        <>
+                          <div className="flex items-center justify-between gap-1 text-emerald-600 dark:text-emerald-400 font-semibold">
+                            <span className="truncate">{src.title}</span>
+                            {safeHref && <ExternalLink className="w-3 h-3 shrink-0" />}
+                          </div>
+                          <div className="font-mono text-[10px] text-zinc-400 truncate">{src.url}</div>
+                          <p className="text-[11px] text-zinc-600 dark:text-zinc-400 line-clamp-2">{src.snippet}</p>
+                        </>
+                      );
+                      return safeHref ? (
+                        <a
+                          key={i}
+                          href={safeHref}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="rounded-xl border border-emerald-500/20 bg-zinc-50 dark:bg-[#050706] p-3 hover:border-emerald-500/50 transition-colors space-y-1 block"
+                        >
+                          {cardBody}
+                        </a>
+                      ) : (
+                        <div
+                          key={i}
+                          className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] p-3 space-y-1 block opacity-75"
+                        >
+                          {cardBody}
                         </div>
-                        <div className="font-mono text-[10px] text-zinc-400 truncate">{src.url}</div>
-                        <p className="text-[11px] text-zinc-600 dark:text-zinc-400 line-clamp-2">{src.snippet}</p>
-                      </a>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}

@@ -61,6 +61,14 @@ test('classifyProviderError distinguishes auth, rate limit, quota, latency, and 
   assert.equal(unavailErr.errorClass, 'provider_unavailable');
   assert.equal(unavailErr.healthStatus, 'temporarily_unavailable');
   assert.equal(unavailErr.retryable, true);
+
+  const deepinfraBalanceErr = classifyProviderError(
+    'You need positive balance to do inference. Please add balance manually or setup top-up',
+    402
+  );
+  assert.equal(deepinfraBalanceErr.errorClass, 'quota_exceeded');
+  assert.equal(deepinfraBalanceErr.healthStatus, 'temporarily_unavailable');
+  assert.equal(deepinfraBalanceErr.retryable, false);
 });
 
 test('buildDagExecutionBatches topologically groups waves and rejects cycles/unknown deps', () => {

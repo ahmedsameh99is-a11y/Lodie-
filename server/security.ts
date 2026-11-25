@@ -53,12 +53,18 @@ export function hashToken(token: string): string {
 export interface SessionPayload {
   uid: string;
   exp: number;
+  ver?: number;
 }
 
-export function signSessionCookie(userId: string, ttlSeconds = 60 * 60 * 24 * 7): string {
+export function signSessionCookie(
+  userId: string,
+  sessionVersion = 1,
+  ttlSeconds = 60 * 60 * 24 * 7
+): string {
   const payload: SessionPayload = {
     uid: userId,
     exp: Math.floor(Date.now() / 1000) + ttlSeconds,
+    ver: sessionVersion,
   };
   const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_KEY).update(body).digest('base64url');
@@ -162,8 +168,8 @@ function appendPartitionedAttribute(res: Response): void {
   res.setHeader('Set-Cookie', updated.length === 1 ? updated[0] : updated);
 }
 
-export function setSessionCookie(res: Response, userId: string, req?: Request): void {
-  const token = signSessionCookie(userId);
+export function setSessionCookie(res: Response, userId: string, req?: Request, sessionVersion = 1): void {
+  const token = signSessionCookie(userId, sessionVersion);
   const https = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,

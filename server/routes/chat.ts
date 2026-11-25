@@ -338,6 +338,8 @@ chatRouter.get('/conversations/:id/messages', requireAuth, (req: AuthenticatedRe
       citations: r.citations_json ? JSON.parse(String(r.citations_json)) : undefined,
       modelId: r.model_id ? String(r.model_id) : undefined,
       provider: r.provider ? String(r.provider) : undefined,
+      upstreamModelId: r.upstream_model_id ? String(r.upstream_model_id) : undefined,
+      upstreamAttribution: r.upstream_attribution ? String(r.upstream_attribution) : undefined,
       inputTokens: r.input_tokens !== null ? Number(r.input_tokens) : undefined,
       outputTokens: r.output_tokens !== null ? Number(r.output_tokens) : undefined,
       cachedTokens: r.cached_tokens !== null ? Number(r.cached_tokens) : undefined,
@@ -636,6 +638,36 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
     work: 'Mode: Work & Planning — Break goals into actionable milestones, dependencies, owners, and acceptance checks.',
   };
 
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const abortController = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
+  const sendEvent = (event: string, data: unknown) => {
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+  };
+
+  sendEvent('meta', {
+    conversationId,
+    userMessageId,
+    modelId: model.id,
+    resolvedMode,
+    citations: [],
+  });
+
+  if (hasImageAttachments || (documentAttachments && documentAttachments.length > 0)) {
+    sendEvent('status', { stage: 'analyzing_files' });
+  }
+
   let systemInstruction = `You are LOODY (${model.displayName}), an independent AI workspace assistant. Format math with standard LaTeX ($...$ or $$...$$) and code in fenced markdown blocks.\n${modeDirectives[resolvedMode]}`;
 
   if (projectId) {
@@ -666,22 +698,15 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
   }
 
   // Execute safe read-only / compute enabled tools when selected in composer
-  if (enabledToolIds && enabledToolIds.length > 0) {
+  if (enabledToolIds && enabledToolIds.length > 0 && !abortController.signal.aborted) {
     const available = listBuiltinTools().filter((t) => t.enabled && enabledToolIds.includes(t.id));
     if (available.length > 0) {
       const toolNotes: string[] = [];
+      let announcedGenericTools = false;
       for (const tool of available) {
-        if (tool.id === 'utc_clock') {
-          const r = await runBuiltinToolById({
-            userId: user.id,
-            userEmail: user.email,
-            toolId: 'utc_clock',
-            input: { timezone: 'UTC' },
-          });
-          toolNotes.push(`utc_clock: ${JSON.stringify(r.output ?? r.error)}`);
-        } else if (tool.id === 'token_budget_estimator') {
-          toolNotes.push(`token_budget_estimator prompt estimate: ~${estimateTextTokens(prompt)} tokens`);
-        } else if (tool.id === 'gemini_web_search' && resolvedMode === 'research') {
+        if (abortController.signal.aborted) break;
+        if (tool.id === 'gemini_web_search' && resolvedMode === 'research') {
+          sendEvent('status', { stage: 'searching' });
           const r = await runBuiltinToolById({
             userId: user.id,
             userEmail: user.email,
@@ -698,6 +723,22 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
                 })
               : `gemini_web_search unavailable: ${r.error}`
           );
+          continue;
+        }
+        if (!announcedGenericTools) {
+          sendEvent('status', { stage: 'using_tools', detail: tool.name });
+          announcedGenericTools = true;
+        }
+        if (tool.id === 'utc_clock') {
+          const r = await runBuiltinToolById({
+            userId: user.id,
+            userEmail: user.email,
+            toolId: 'utc_clock',
+            input: { timezone: 'UTC' },
+          });
+          toolNotes.push(`utc_clock: ${JSON.stringify(r.output ?? r.error)}`);
+        } else if (tool.id === 'token_budget_estimator') {
+          toolNotes.push(`token_budget_estimator prompt estimate: ~${estimateTextTokens(prompt)} tokens`);
         } else {
           toolNotes.push(`${tool.id}: ${tool.description}`);
         }
@@ -730,7 +771,7 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
 
   // Retrieve semantic/lexical RAG citations from workspace & project files
   let citations: KnowledgeCitation[] = [];
-  if (mode !== 'continue') {
+  if (mode !== 'continue' && !abortController.signal.aborted) {
     citations = await retrieveKnowledgeCitations({
       userId: user.id,
       projectId,
@@ -739,6 +780,14 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
       allowEmbeddings: false,
     }).catch(() => []);
     if (citations.length > 0) {
+      sendEvent('status', { stage: 'reading_sources', detail: `${citations.length}` });
+      sendEvent('meta', {
+        conversationId,
+        userMessageId,
+        modelId: model.id,
+        resolvedMode,
+        citations,
+      });
       const ragBlock = citations
         .map((c, i) =>
           wrapUntrustedContext({
@@ -775,37 +824,27 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
     });
   }
 
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders?.();
+  if (abortController.signal.aborted) {
+    sendEvent('done', { conversationId, aborted: true });
+    if (!res.writableEnded) res.end();
+    return;
+  }
 
-  const abortController = new AbortController();
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      abortController.abort();
-    }
-  });
-
-  const sendEvent = (event: string, data: unknown) => {
-    if (!res.writableEnded && !res.destroyed) {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    }
-  };
-
-  sendEvent('meta', {
-    conversationId,
-    userMessageId,
-    modelId: model.id,
-    resolvedMode,
-    citations,
-  });
+  let currentStatusStage: 'thinking' | 'generating' =
+    resolvedMode === 'deep_thinking' ? 'thinking' : 'generating';
+  sendEvent('status', { stage: currentStatusStage });
 
   const activeRunModel = model;
   let activeRunProvider = model.provider;
   let activeRunUpstreamModelId = model.upstreamModelId;
+  let reportedUpstreamAttribution: string | undefined;
   let assistantContent = '';
-  let reportedUsage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } | undefined;
+  let reportedUsage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedTokens?: number;
+    reportedCostUsd?: number;
+  } | undefined;
   let fallbackNotice: string | undefined;
   let persistedReply: {
     messageId: string;
@@ -813,6 +852,13 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
     costUsd: number;
     quota: Omit<ReturnType<typeof getDetailedUserQuota>, 'byModelToday'>;
   } | null = null;
+
+  const tProviderStart = performance.now();
+  let tFirstTokenPerf: number | null = null;
+  let tStreamEndPerf: number | null = null;
+  let tPersistStartPerf: number | null = null;
+  let tPersistEndPerf: number | null = null;
+  let attemptCount = 0;
 
   const persistAssistantReply = () => {
     if (persistedReply) return persistedReply;
@@ -823,12 +869,22 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
       fallbackInputText: historyRows.map((h) => h.content).join('\n'),
       fallbackOutputText: assistantContent,
     });
-    const costUsd = computeEstimatedCostUsd({
-      provider: activeRunProvider,
-      inputTokens: reconciled.inputTokens,
-      outputTokens: reconciled.outputTokens,
-      cachedTokens: reconciled.cachedTokens,
-    });
+    const costUsd =
+      typeof reportedUsage?.reportedCostUsd === 'number' &&
+      Number.isFinite(reportedUsage.reportedCostUsd) &&
+      reportedUsage.reportedCostUsd >= 0
+        ? Number(reportedUsage.reportedCostUsd.toFixed(6))
+        : computeEstimatedCostUsd({
+            provider: activeRunProvider,
+            inputTokens: reconciled.inputTokens,
+            outputTokens: reconciled.outputTokens,
+            cachedTokens: reconciled.cachedTokens,
+          });
+    const latencyMs = Math.max(
+      1,
+      Math.round((tStreamEndPerf ?? performance.now()) - tProviderStart)
+    );
+    const recordedAttempts = Math.max(1, attemptCount);
 
     const assistantMsgId = crypto.randomUUID();
     const finishedAt = new Date().toISOString();
@@ -836,8 +892,8 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
     db.prepare(`
       INSERT INTO messages (
         id, conversation_id, user_id, role, content, citations_json, model_id, provider, upstream_model_id,
-        input_tokens, output_tokens, cached_tokens, token_accounting_type, created_at
-      ) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        upstream_attribution, input_tokens, output_tokens, cached_tokens, token_accounting_type, created_at
+      ) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       assistantMsgId,
       conversationId,
@@ -847,6 +903,7 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
       activeRunModel.id,
       activeRunProvider,
       activeRunUpstreamModelId,
+      reportedUpstreamAttribution ?? null,
       reconciled.inputTokens,
       reconciled.outputTokens,
       reconciled.cachedTokens,
@@ -863,9 +920,10 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
 
     db.prepare(`
       INSERT INTO token_usage (
-        id, user_id, conversation_id, model_id, provider, upstream_model_id, task_type, input_tokens, output_tokens,
+        id, user_id, conversation_id, model_id, provider, upstream_model_id, upstream_attribution,
+        task_type, latency_ms, fallback_attempts, error_class, input_tokens, output_tokens,
         cached_tokens, accounting_type, estimated_cost_usd, usage_date, usage_month, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       crypto.randomUUID(),
       user.id,
@@ -873,7 +931,11 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
       activeRunModel.id,
       activeRunProvider,
       activeRunUpstreamModelId,
+      reportedUpstreamAttribution ?? null,
       taskType,
+      latencyMs,
+      recordedAttempts,
+      null,
       reconciled.inputTokens,
       reconciled.outputTokens,
       reconciled.cachedTokens,
@@ -943,13 +1005,6 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
     `).run(nextHealth, rawMsg.slice(0, 240), testedAt, nextErrClass, params.latencyMs, rawMsg.slice(0, 480), params.targetModelId);
   };
 
-  const tProviderStart = performance.now();
-  let tFirstTokenPerf: number | null = null;
-  let tStreamEndPerf: number | null = null;
-  let tPersistStartPerf: number | null = null;
-  let tPersistEndPerf: number | null = null;
-  let attemptCount = 0;
-
   try {
     const primaryStart = Date.now();
     try {
@@ -967,6 +1022,7 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
             attemptCount = Math.max(attemptCount, info.attemptIndex + 1);
             activeRunProvider = info.route.provider;
             activeRunUpstreamModelId = info.route.upstreamModelId;
+            reportedUpstreamAttribution = undefined;
             if (info.fallbackOccurred) {
               fallbackNotice = `${model.displayName} automatically failed over to an alternate backup route (${info.route.provider}) to preserve continuity.`;
               sendEvent('meta', {
@@ -997,12 +1053,24 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
           onChunk: (text) => {
             if (tFirstTokenPerf === null && text.length > 0) {
               tFirstTokenPerf = performance.now();
+              if (currentStatusStage !== 'generating') {
+                currentStatusStage = 'generating';
+                sendEvent('status', { stage: 'generating' });
+              }
             }
             assistantContent += text;
             sendEvent('chunk', { text });
           },
           onUsage: (u) => {
             reportedUsage = u;
+          },
+          onProviderMeta: (meta) => {
+            if (meta.upstreamAttribution) {
+              reportedUpstreamAttribution = meta.upstreamAttribution;
+            }
+            if (typeof meta.reportedCostUsd === 'number') {
+              reportedUsage = { ...reportedUsage, reportedCostUsd: meta.reportedCostUsd };
+            }
           },
         },
       });
@@ -1082,6 +1150,7 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
       JSON.stringify({
         modelId: activeRunModel.id,
         provider: activeRunProvider,
+        ...(reportedUpstreamAttribution ? { upstreamAttribution: reportedUpstreamAttribution } : {}),
         attemptCount,
         ...timingsMs,
       })
@@ -1092,6 +1161,7 @@ chatRouter.post('/chat/stream', requireAuth, chatLimiter, async (req: Authentica
         messageId: saved.messageId,
         conversationId,
         modelId: activeRunModel.id,
+        ...(reportedUpstreamAttribution ? { upstreamAttribution: reportedUpstreamAttribution } : {}),
         aborted: abortController.signal.aborted || undefined,
         citations,
         usage: {

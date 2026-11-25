@@ -195,3 +195,32 @@ test('parseSharedTranscriptSafely handles valid, invalid type, and corrupted JSO
   assert.equal(malformed.messages.length, 0);
   assert.ok(malformed.error);
 });
+
+test('createSseStreamProcessor dispatches real status events without breaking chunk/done flow', () => {
+  const stages: Array<{ stage: string; detail?: string }> = [];
+  const chunks: string[] = [];
+  const proc = createSseStreamProcessor({
+    onMeta: () => {},
+    onStatus: (s) => stages.push(s),
+    onChunk: (c) => chunks.push(c),
+    onDone: () => {},
+    onError: () => assert.fail('unexpected error'),
+  });
+
+  proc.feed('event: status\ndata: {"stage":"searching"}\n\n');
+  proc.feed('event: status\ndata: {"stage":"reading_');
+  proc.feed('sources","detail":"2 citations"}\n\n');
+  proc.feed('event: status\ndata: {"stage":"generating"}\n\n');
+  proc.feed('event: chunk\ndata: {"text":"Done"}\n\n');
+  proc.feed('event: done\ndata: {"conversationId":"c1"}\n\n');
+  const summary = proc.finalize();
+
+  assert.equal(summary.receivedDone, true);
+  assert.deepEqual(stages, [
+    { stage: 'searching', detail: undefined },
+    { stage: 'reading_sources', detail: '2 citations' },
+    { stage: 'generating', detail: undefined },
+  ]);
+  assert.deepEqual(chunks, ['Done']);
+});
+

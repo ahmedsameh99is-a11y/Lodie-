@@ -124,6 +124,12 @@ export async function attachAuth(req: AuthenticatedRequest, _res: Response, next
         | Record<string, unknown>
         | undefined;
       if (row) {
+        const currentVer = Number(row.session_version ?? 1);
+        const tokenVer = typeof payload.ver === 'number' ? payload.ver : 1;
+        if (currentVer !== tokenVer) {
+          next();
+          return;
+        }
         const email = String(row.email ?? '');
         if (email && isDeveloperAllowlisted(email) && (row.role !== 'developer' || row.plan !== 'developer')) {
           const devLimits = DEFAULT_PLAN_LIMITS.developer;

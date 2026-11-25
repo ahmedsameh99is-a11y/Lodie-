@@ -243,8 +243,14 @@ tasksRouter.patch('/:id/subtasks/:subId', (req: AuthenticatedRequest, res) => {
     res.status(404).json({ error: 'Subtask not found.' });
     return;
   }
-  db.prepare('UPDATE project_tasks SET updated_at = ? WHERE id = ?').run(new Date().toISOString(), req.params.id);
-  const updated = db.prepare('SELECT * FROM project_tasks WHERE id = ?').get(req.params.id) as Record<string, unknown>;
+  db.prepare('UPDATE project_tasks SET updated_at = ? WHERE id = ? AND user_id = ?').run(
+    new Date().toISOString(),
+    req.params.id,
+    req.authUser!.id
+  );
+  const updated = db
+    .prepare('SELECT * FROM project_tasks WHERE id = ? AND user_id = ?')
+    .get(req.params.id, req.authUser!.id) as Record<string, unknown>;
   res.json({ task: hydrateTask(updated) });
 });
 
@@ -257,7 +263,9 @@ tasksRouter.patch('/:id/milestones/:mileId', (req: AuthenticatedRequest, res) =>
     res.status(404).json({ error: 'Milestone not found.' });
     return;
   }
-  const updated = db.prepare('SELECT * FROM project_tasks WHERE id = ?').get(req.params.id) as Record<string, unknown>;
+  const updated = db
+    .prepare('SELECT * FROM project_tasks WHERE id = ? AND user_id = ?')
+    .get(req.params.id, req.authUser!.id) as Record<string, unknown>;
   res.json({ task: hydrateTask(updated) });
 });
 

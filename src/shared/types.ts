@@ -47,7 +47,9 @@ export interface ProviderStatusSummary {
   defaultBaseUrl: string;
   supportsVision: boolean;
   supportsStreaming: boolean;
+  supportsTools?: boolean;
   supportsPromptCaching: boolean;
+  isGateway?: boolean;
   circuitState: CircuitState;
   consecutiveFailures: number;
   avgLatencyMs: number | null;
@@ -277,6 +279,7 @@ export interface ChatMessage {
   modelId?: string;
   provider?: ProviderId;
   upstreamModelId?: string;
+  upstreamAttribution?: string;
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
@@ -320,7 +323,11 @@ export interface TokenUsageSummary {
     id: string;
     modelId: string;
     provider: ProviderId;
+    upstreamModelId?: string;
+    upstreamAttribution?: string;
     taskType?: string;
+    latencyMs?: number | null;
+    fallbackAttempts?: number;
     inputTokens: number;
     outputTokens: number;
     cachedTokens: number;

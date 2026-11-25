@@ -27,6 +27,8 @@ modelsRouter.get('/admin/capabilities', requireDeveloper, async (_req: Authentic
     gemini: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
     groq: Boolean(process.env.GROQ_API_KEY),
     nvidia: Boolean(process.env.NVIDIA_API_KEY),
+    openrouter: Boolean(process.env.OPENROUTER_API_KEY),
+    deepinfra: Boolean(process.env.DEEPINFRA_API_KEY),
     openai: Boolean(process.env.OPENAI_API_KEY),
     openaiCustomBaseUrl: Boolean(process.env.OPENAI_BASE_URL),
     anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
@@ -117,6 +119,87 @@ modelsRouter.get('/admin/capabilities', requireDeveloper, async (_req: Authentic
     }
   }
 
+  let openrouterModels: Array<{
+    id: string;
+    context_length?: number;
+    supportsVision: boolean;
+    supportsTools: boolean;
+  }> = [];
+  let openrouterDiscoveryError: string | null = null;
+  const openrouterCreds = resolveProviderCredentials({ provider: 'openrouter' });
+  if (openrouterCreds.configured && openrouterCreds.apiKey && openrouterCreds.baseUrl) {
+    try {
+      const orResp = await fetch(`${openrouterCreds.baseUrl.replace(/\/$/, '')}/models`, {
+        headers: {
+          Authorization: `Bearer ${openrouterCreds.apiKey}`,
+          ...(PROVIDER_CATALOG.openrouter.extraHeaders?.() ?? {}),
+        },
+        signal: AbortSignal.timeout(6_000),
+      });
+      if (!orResp.ok) {
+        openrouterDiscoveryError = `HTTP ${orResp.status}`;
+      } else {
+        const orJson = (await orResp.json()) as {
+          data?: Array<{
+            id?: string;
+            context_length?: number;
+            architecture?: { input_modalities?: string[] };
+            supported_parameters?: string[];
+          }>;
+        };
+        openrouterModels = (orJson.data ?? [])
+          .filter((m) => m.id)
+          .slice(0, 120)
+          .map((m) => ({
+            id: String(m.id),
+            context_length: typeof m.context_length === 'number' ? m.context_length : undefined,
+            supportsVision: Boolean(m.architecture?.input_modalities?.includes('image')),
+            supportsTools: Boolean(m.supported_parameters?.includes('tools')),
+          }));
+      }
+    } catch (err) {
+      openrouterDiscoveryError = err instanceof Error ? err.message : 'Failed to list OpenRouter models.';
+    }
+  }
+
+  let deepinfraModels: Array<{
+    id: string;
+    context_length?: number;
+    supportsVision: boolean;
+  }> = [];
+  let deepinfraDiscoveryError: string | null = null;
+  const deepinfraCreds = resolveProviderCredentials({ provider: 'deepinfra' });
+  if (deepinfraCreds.configured && deepinfraCreds.apiKey && deepinfraCreds.baseUrl) {
+    try {
+      const diResp = await fetch(`${deepinfraCreds.baseUrl.replace(/\/$/, '')}/models`, {
+        headers: { Authorization: `Bearer ${deepinfraCreds.apiKey}` },
+        signal: AbortSignal.timeout(6_000),
+      });
+      if (!diResp.ok) {
+        deepinfraDiscoveryError = `HTTP ${diResp.status}`;
+      } else {
+        const diJson = (await diResp.json()) as {
+          data?: Array<{
+            id?: string;
+            metadata?: { context_length?: number; tags?: string[] };
+          }>;
+        };
+        deepinfraModels = (diJson.data ?? [])
+          .filter((m) => m.id)
+          .slice(0, 120)
+          .map((m) => ({
+            id: String(m.id),
+            context_length: typeof m.metadata?.context_length === 'number' ? m.metadata.context_length : undefined,
+            supportsVision: Boolean(
+              m.metadata?.tags?.includes('vision') || m.metadata?.tags?.includes('vlm')
+            ),
+          }));
+      }
+    } catch (err) {
+      deepinfraDiscoveryError = err instanceof Error ? err.message : 'Failed to list DeepInfra models.';
+    }
+  }
+
   let hostedOssModels: string[] = [];
   let hostedOssError: string | null = null;
   if (process.env.HOSTED_OSS_BASE_URL) {
@@ -148,6 +231,10 @@ modelsRouter.get('/admin/capabilities', requireDeveloper, async (_req: Authentic
     groqDiscoveryError,
     nvidiaModels,
     nvidiaDiscoveryError,
+    openrouterModels,
+    openrouterDiscoveryError,
+    deepinfraModels,
+    deepinfraDiscoveryError,
     hostedOssModels,
     hostedOssError,
     providers: summaries,

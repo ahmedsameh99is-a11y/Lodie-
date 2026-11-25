@@ -117,7 +117,10 @@ authRouter.post('/firebase-exchange', authLimiter, async (req, res) => {
   }
 
   const user = upsertUserFromFirebaseIdentity(identity);
-  setSessionCookie(res, user.id, req);
+  const verRow = db.prepare('SELECT session_version FROM users WHERE id = ?').get(user.id) as
+    | { session_version?: number }
+    | undefined;
+  setSessionCookie(res, user.id, req, Number(verRow?.session_version ?? 1));
 
   const { byModelToday: _ignored, ...publicQuota } = getDetailedUserQuota(user);
   res.json({
@@ -160,7 +163,7 @@ authRouter.post('/login', authLimiter, (req, res) => {
     ).run('developer', 'developer', devLimits.daily, devLimits.monthly, new Date().toISOString(), userId);
   }
 
-  setSessionCookie(res, userId, req);
+  setSessionCookie(res, userId, req, Number(row.session_version ?? 1));
 
   recordAuditLog({
     actorUserId: userId,
@@ -276,11 +279,9 @@ authRouter.post('/password-reset/confirm', authLimiter, (req, res) => {
   }
 
   const now = new Date().toISOString();
-  db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(
-    hashPassword(parsed.data.newPassword),
-    now,
-    row.user_id
-  );
+  db.prepare(
+    'UPDATE users SET password_hash = ?, session_version = session_version + 1, updated_at = ? WHERE id = ?'
+  ).run(hashPassword(parsed.data.newPassword), now, row.user_id);
   db.prepare('UPDATE password_resets SET used_at = ? WHERE id = ?').run(now, row.id);
 
   recordAuditLog({

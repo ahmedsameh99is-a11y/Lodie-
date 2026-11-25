@@ -105,6 +105,10 @@ export async function runBuiltinToolById(params: ToolRunParams): Promise<ToolRun
       case 'regex_tester': {
         const pattern = typeof params.input.pattern === 'string' ? params.input.pattern.slice(0, 120) : '';
         const sample = typeof params.input.sample === 'string' ? params.input.sample.slice(0, 2000) : '';
+        // Reject catastrophic nested quantifier ReDoS patterns before compilation
+        if (/(\([^)]*[+*][^)]*\)|\[[^\]]*\][+*]|[+*])\s*[+*{]/.test(pattern) || /\\\d+\s*[+*{]/.test(pattern)) {
+          throw new Error('Regex pattern rejected due to nested quantifier complexity risk.');
+        }
         const re = new RegExp(pattern);
         const match = re.exec(sample);
         output = {
@@ -204,7 +208,25 @@ export async function runBuiltinToolById(params: ToolRunParams): Promise<ToolRun
           });
           clearTimeout(timer);
           if (!resp.ok) throw new Error(`HTTP ${resp.status} while fetching URL`);
-          const html = await resp.text();
+          const MAX_FETCH_BYTES = 512 * 1024;
+          const reader = resp.body?.getReader();
+          let html = '';
+          if (reader) {
+            const decoder = new TextDecoder();
+            let receivedBytes = 0;
+            while (receivedBytes < MAX_FETCH_BYTES) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value) {
+                receivedBytes += value.byteLength;
+                html += decoder.decode(value, { stream: true });
+              }
+            }
+            html += decoder.decode();
+            await reader.cancel().catch(() => null);
+          } else {
+            html = (await resp.text()).slice(0, MAX_FETCH_BYTES);
+          }
           const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
           const cleanText = html
             .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -278,6 +300,18 @@ export async function runBuiltinToolById(params: ToolRunParams): Promise<ToolRun
           params.input.priority === 'high' || params.input.priority === 'low'
             ? params.input.priority
             : 'medium';
+        const rawProjectId =
+          typeof params.input.projectId === 'string' && params.input.projectId.trim()
+            ? params.input.projectId.trim()
+            : null;
+        if (rawProjectId) {
+          const ownedProject = db
+            .prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?')
+            .get(rawProjectId, params.userId) as { id: string } | undefined;
+          if (!ownedProject) {
+            throw new Error('Target project not found or access denied.');
+          }
+        }
         const taskId = crypto.randomUUID();
         const now = new Date().toISOString();
         db.prepare(`
@@ -286,7 +320,7 @@ export async function runBuiltinToolById(params: ToolRunParams): Promise<ToolRun
         `).run(
           taskId,
           params.userId,
-          typeof params.input.projectId === 'string' ? params.input.projectId : null,
+          rawProjectId,
           title,
           typeof params.input.description === 'string' ? params.input.description.slice(0, 1000) : '',
           priority,

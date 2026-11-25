@@ -539,6 +539,7 @@ function runMigrations() {
   ensureColumn('users', 'auth_provider', "TEXT NOT NULL DEFAULT 'password'");
   ensureColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('users', 'firebase_uid', 'TEXT');
+  ensureColumn('users', 'session_version', 'INTEGER NOT NULL DEFAULT 1');
 
   ensureColumn('projects', 'preferred_model_id', "TEXT NOT NULL DEFAULT 'sonic-3'");
   ensureColumn('projects', 'enabled_tools_json', "TEXT NOT NULL DEFAULT '[]'");
@@ -560,8 +561,13 @@ function runMigrations() {
 
   ensureColumn('messages', 'citations_json', 'TEXT');
   ensureColumn('messages', 'upstream_model_id', 'TEXT');
+  ensureColumn('messages', 'upstream_attribution', 'TEXT');
   ensureColumn('token_usage', 'task_type', "TEXT NOT NULL DEFAULT 'chat'");
   ensureColumn('token_usage', 'upstream_model_id', 'TEXT');
+  ensureColumn('token_usage', 'upstream_attribution', 'TEXT');
+  ensureColumn('token_usage', 'latency_ms', 'INTEGER');
+  ensureColumn('token_usage', 'fallback_attempts', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('token_usage', 'error_class', 'TEXT');
   ensureColumn('model_registry', 'error_class', 'TEXT');
   ensureColumn('model_registry', 'avg_latency_ms', 'INTEGER');
   ensureColumn('model_registry', 'last_error_detail', 'TEXT');

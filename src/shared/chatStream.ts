@@ -47,8 +47,22 @@ export interface ChatStreamErrorEventMeta {
   unexpectedEof?: boolean;
 }
 
+export type ChatActivityStage =
+  | 'analyzing_files'
+  | 'searching'
+  | 'using_tools'
+  | 'reading_sources'
+  | 'thinking'
+  | 'generating';
+
+export interface ChatStreamStatusEvent {
+  stage: ChatActivityStage;
+  detail?: string;
+}
+
 export interface SseStreamHandlers {
   onMeta: (meta: ChatStreamMetaEvent) => void;
+  onStatus?: (status: ChatStreamStatusEvent) => void;
   onChunk: (text: string) => void;
   onDone: (done: ChatStreamDoneEvent) => void;
   onError: (err: string, meta?: ChatStreamErrorEventMeta) => void;
@@ -94,6 +108,13 @@ export function createSseStreamProcessor(handlers: SseStreamHandlers) {
       if (eventName === 'meta') {
         receivedMeta = true;
         handlers.onMeta(payload as unknown as ChatStreamMetaEvent);
+      } else if (eventName === 'status') {
+        if (typeof payload.stage === 'string' && handlers.onStatus) {
+          handlers.onStatus({
+            stage: payload.stage as ChatActivityStage,
+            detail: typeof payload.detail === 'string' ? payload.detail : undefined,
+          });
+        }
       } else if (eventName === 'chunk') {
         chunkCount += 1;
         handlers.onChunk(typeof payload.text === 'string' ? payload.text : '');

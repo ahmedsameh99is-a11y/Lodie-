@@ -154,6 +154,7 @@ filesRouter.post('/', fileUploadLimiter, async (req: AuthenticatedRequest, res) 
       preExtractedText: parsed.data.extractedText,
     });
 
+    const verifiedSizeBytes = buffer.length;
     db.prepare(`
       INSERT INTO workspace_files (
         id, user_id, name, mime_type, size_bytes, extracted_text,
@@ -164,7 +165,7 @@ filesRouter.post('/', fileUploadLimiter, async (req: AuthenticatedRequest, res) 
       userId,
       parsed.data.name,
       parsed.data.mimeType,
-      parsed.data.sizeBytes,
+      verifiedSizeBytes,
       extracted.extractedText,
       parsed.data.folder,
       JSON.stringify(parsed.data.tags),
@@ -192,7 +193,7 @@ filesRouter.post('/', fileUploadLimiter, async (req: AuthenticatedRequest, res) 
       targetType: 'file',
       targetId: id,
       outcome: 'success',
-      detail: `Uploaded ${parsed.data.name} (${extracted.fileCategory}, ${parsed.data.sizeBytes} bytes)`,
+      detail: `Uploaded ${parsed.data.name} (${extracted.fileCategory}, ${verifiedSizeBytes} bytes)`,
     });
 
     const row = db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(id) as Record<string, unknown>;
@@ -249,8 +250,11 @@ filesRouter.get('/:id/download', (req: AuthenticatedRequest, res) => {
   }
 
   const safeName = String(row.name).replace(/["\r\n]/g, '_');
-  const mime = String(row.mime_type || 'application/octet-stream');
-  const inline = req.query.inline === '1';
+  const rawMime = String(row.mime_type || 'application/octet-stream').toLowerCase();
+  const isScriptable =
+    /(html|svg|javascript|ecmascript|xhtml)/i.test(rawMime) || /\.(html?|svg|xhtml|mjs|js)$/i.test(safeName);
+  const mime = isScriptable ? 'text/plain; charset=utf-8' : rawMime;
+  const inline = req.query.inline === '1' && !isScriptable;
 
   res.setHeader('Content-Type', mime);
   res.setHeader('Content-Security-Policy', 'sandbox');

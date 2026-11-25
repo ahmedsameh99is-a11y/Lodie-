@@ -247,3 +247,52 @@ test('extractDocumentContent parses real XLSX, DOCX, and PDF binary buffers', as
   assert.equal(pdfRes.fileCategory, 'document');
   assert.match(pdfRes.extractedText, /LOODY Roadmap PDF Extraction Test/);
 });
+
+test('PoC: built-in tool engine blocks cross-user project_task_creator IDOR and ReDoS regex patterns', async () => {
+  const { runBuiltinToolById } = await import('./tools/engine');
+  const now = new Date().toISOString();
+  const ownerId = `sec-owner-${Date.now()}`;
+  const attackerId = `sec-attacker-${Date.now()}`;
+  const ownerProjId = `sec-proj-${Date.now()}`;
+
+  db.prepare(`
+    INSERT INTO users (id, email, password_hash, display_name, role, plan, created_at, updated_at)
+    VALUES (?, ?, '', 'Owner', 'user', 'free', ?, ?)
+  `).run(ownerId, `${ownerId}@loody.local`, now, now);
+  db.prepare(`
+    INSERT INTO users (id, email, password_hash, display_name, role, plan, created_at, updated_at)
+    VALUES (?, ?, '', 'Attacker', 'user', 'free', ?, ?)
+  `).run(attackerId, `${attackerId}@loody.local`, now, now);
+  db.prepare(`
+    INSERT INTO projects (id, user_id, name, description, instructions, created_at, updated_at)
+    VALUES (?, ?, 'Private Proj', '', '', ?, ?)
+  `).run(ownerProjId, ownerId, now, now);
+
+  try {
+    const idorAttempt = await runBuiltinToolById({
+      userId: attackerId,
+      userEmail: `${attackerId}@loody.local`,
+      toolId: 'project_task_creator',
+      approvedByUser: true,
+      input: { title: 'Cross-Tenant Task', projectId: ownerProjId },
+    });
+    assert.equal(idorAttempt.ok, false);
+    assert.match(String(idorAttempt.error ?? ''), /not found|denied/i);
+    const leaked = db.prepare('SELECT COUNT(*) AS c FROM project_tasks WHERE project_id = ?').get(ownerProjId) as { c: number };
+    assert.equal(leaked.c, 0);
+
+    const redosAttempt = await runBuiltinToolById({
+      userId: ownerId,
+      userEmail: `${ownerId}@loody.local`,
+      toolId: 'regex_tester',
+      input: { pattern: '(a+)+$', sample: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaa!' },
+    });
+    assert.equal(redosAttempt.ok, false);
+    assert.match(String(redosAttempt.error ?? ''), /nested quantifier/i);
+  } finally {
+    db.prepare('DELETE FROM project_tasks WHERE project_id = ?').run(ownerProjId);
+    db.prepare('DELETE FROM projects WHERE id = ?').run(ownerProjId);
+    db.prepare('DELETE FROM users WHERE id IN (?, ?)').run(ownerId, attackerId);
+  }
+});
+

@@ -592,3 +592,91 @@ test('Phase 0.3 createRateLimiter bounds memory growth and cross-user agent cont
   assert.equal(stillRunning.status, 'running');
   db.prepare('DELETE FROM agent_runs WHERE id = ?').run(runId);
 });
+
+test('PoC: password reset revokes prior session cookies, creative rejects spoofed JPEG, and inline HTML/SVG downloads are neutralized', async () => {
+  const cryptoMod = await import('node:crypto');
+  const { hashToken } = await import('./security');
+
+  // 1. Capture active session cookie before password reset
+  const preResetLogin = await apiReq('/api/v1/auth/login', {
+    method: 'POST',
+    body: { email: userAEmail, password: 'Phase03StrongPassword!' },
+  });
+  assert.equal(preResetLogin.status, 200);
+  const oldCookie = preResetLogin.cookie!;
+
+  // Insert reset token and confirm reset
+  const resetToken = 'reset-poc-token-' + cryptoMod.randomBytes(12).toString('hex');
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  db.prepare(`
+    INSERT INTO password_resets (id, user_id, token_hash, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(cryptoMod.randomUUID(), userAId, hashToken(resetToken), expiresAt, now);
+
+  const resetConfirm = await apiReq('/api/v1/auth/password-reset/confirm', {
+    method: 'POST',
+    body: { token: resetToken, newPassword: 'Phase03RotatedPassword!' },
+  });
+  assert.equal(resetConfirm.status, 200);
+
+  // Old cookie issued prior to password reset must now resolve to unauthenticated
+  const staleCheck = await apiReq('/api/v1/auth/me', { cookie: oldCookie });
+  assert.equal(staleCheck.status, 200);
+  assert.equal(staleCheck.data.user, null);
+
+  // New login with rotated password issues valid session
+  const freshLogin = await apiReq('/api/v1/auth/login', {
+    method: 'POST',
+    body: { email: userAEmail, password: 'Phase03RotatedPassword!' },
+  });
+  assert.equal(freshLogin.status, 200);
+  userACookie = freshLogin.cookie!;
+  assert.ok(freshLogin.data.user?.id === userAId);
+
+  // Restore original password cleanly
+  const { hashPassword } = await import('./security');
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
+    hashPassword('Phase03StrongPassword!'),
+    userAId
+  );
+
+  // 2. Creative Studio rejects forged JPEG upload
+  const forgedJpeg = await apiReq('/api/v1/creative/assets', {
+    method: 'POST',
+    cookie: userBCookie,
+    body: {
+      kind: 'image',
+      name: 'fake.jpg',
+      mimeType: 'image/jpeg',
+      dataBase64: Buffer.from('NOT_A_REAL_JPEG_HEADER').toString('base64'),
+    },
+  });
+  assert.equal(forgedJpeg.status, 400);
+  assert.equal(forgedJpeg.data.code, 'INVALID_IMAGE_BINARY');
+
+  // 3. Scriptable HTML upload cannot be served inline or with text/html Content-Type
+  const htmlContent = '<html><body><script>alert(1)</script></body></html>';
+  const htmlUpload = await apiReq('/api/v1/files', {
+    method: 'POST',
+    cookie: userBCookie,
+    body: {
+      name: 'note.html',
+      mimeType: 'text/html',
+      sizeBytes: 99999, // Verify server stores actual byte length instead
+      extractedText: htmlContent,
+      dataBase64: Buffer.from(htmlContent, 'utf8').toString('base64'),
+    },
+  });
+  assert.equal(htmlUpload.status, 201);
+  assert.equal(htmlUpload.data.file.sizeBytes, Buffer.byteLength(htmlContent, 'utf8'));
+
+  const dlHtml = await fetch(`${baseUrl}/api/v1/files/${htmlUpload.data.file.id}/download?inline=1`, {
+    headers: { Cookie: userBCookie },
+  });
+  assert.equal(dlHtml.status, 200);
+  assert.match(dlHtml.headers.get('content-type') ?? '', /^text\/plain/i);
+  assert.match(dlHtml.headers.get('content-disposition') ?? '', /^attachment;/i);
+  assert.equal(dlHtml.headers.get('content-security-policy'), 'sandbox');
+});
+

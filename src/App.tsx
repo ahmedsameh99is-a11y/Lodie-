@@ -2,19 +2,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import {
-  MessageSquare,
-  Cpu,
-  FolderKanban,
-  Wrench,
-  Settings,
-  Menu,
-  Share2,
-} from 'lucide-react';
+import { PanelLeft, Share2 } from 'lucide-react';
 import { api } from './lib/api';
-import { auth, syncUserProfileToFirestore } from './lib/firebase';
+import { auth, logoutFirebase, syncUserProfileToFirestore } from './lib/firebase';
 import { parseSharedTranscriptSafely } from './shared/chatStream';
 import { t } from './shared/i18n';
+import { toSafeMarkdownUrl } from './shared/safeUrl';
 import type {
   AccentColor,
   AppLanguage,
@@ -264,6 +257,16 @@ export default function App() {
     }
   };
 
+  const handleSignOut = async () => {
+    await api.logout();
+    await logoutFirebase();
+    setUser(null);
+    setProjects([]);
+    setConversations([]);
+    setActiveConvId(null);
+    setUsage({ dailyUsed: 0, monthlyUsed: 0 });
+  };
+
   if (sharedSnapshot || shareError) {
     const parsedShare = sharedSnapshot
       ? parseSharedTranscriptSafely(sharedSnapshot.transcript)
@@ -314,7 +317,9 @@ export default function App() {
                   </div>
                   <div className="prose prose-zinc dark:prose-invert prose-sm max-w-none">
                     <InlineMarkdownErrorBoundary fallbackText={m.content} resetKey={m.content}>
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={toSafeMarkdownUrl}>
+                        {m.content}
+                      </ReactMarkdown>
                     </InlineMarkdownErrorBoundary>
                   </div>
                 </article>
@@ -338,13 +343,22 @@ export default function App() {
         />
       )}
 
-      {/* Left Desktop & Mobile Drawer Sidebar */}
+      {/* Unified Desktop & Mobile Navigation Drawer */}
       <AppSidebar
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         activeView={activeView}
         onSelectView={setActiveView}
         language={language}
+        theme={theme}
+        onChangeLanguage={(next) => {
+          setLanguage(next);
+          updatePref({ language: next });
+        }}
+        onChangeTheme={(next) => {
+          setTheme(next);
+          updatePref({ theme: next });
+        }}
         user={user}
         conversations={conversations}
         activeConvId={activeConvId}
@@ -375,20 +389,23 @@ export default function App() {
           await loadConversations(Boolean(user));
         }}
         onOpenAuth={() => setAuthModalOpen(true)}
+        onSignOut={handleSignOut}
       />
 
-      {/* Right Workspace Column */}
+      {/* Main Workspace Column */}
       <div className="flex flex-1 flex-col min-w-0 h-full">
-        {/* Compact Mobile Top Header (Desktop uses Sidebar brand + user footer, saving vertical height) */}
-        <header className="lg:hidden shrink-0 h-[52px] border-b border-zinc-200 dark:border-emerald-500/15 bg-white/95 dark:bg-[#070A08]/95 backdrop-blur-md px-3 flex items-center justify-between gap-3 pt-safe z-30">
-          <div className="flex items-center gap-2">
+        {/* Single Minimal Global Header (Desktop & Mobile) */}
+        <header className="shrink-0 h-[52px] border-b border-zinc-200 dark:border-emerald-500/15 bg-white/95 dark:bg-[#070A08]/95 backdrop-blur-md px-3 sm:px-4 flex items-center justify-between gap-3 pt-safe z-30">
+          <div className="flex items-center gap-2.5 min-w-0">
             <button
               type="button"
-              onClick={() => setSidebarOpen(true)}
-              aria-label="Open menu"
-              className="flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-200 dark:border-white/10 text-zinc-700 dark:text-zinc-200 cursor-pointer"
+              data-testid="unified-nav-toggle"
+              onClick={() => setSidebarOpen((v) => !v)}
+              aria-label={t(language, 'openNavigation')}
+              aria-expanded={sidebarOpen}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#0D110F] text-zinc-700 dark:text-zinc-200 hover:border-emerald-500/40 hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors cursor-pointer"
             >
-              <Menu className="w-4 h-4" />
+              <PanelLeft className="w-4 h-4" />
             </button>
             <button
               type="button"
@@ -396,32 +413,52 @@ export default function App() {
               className="inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
             >
               <LoodyLogo variant="primary-3d" size={26} />
-              <span className="font-display text-base font-bold">LOODY</span>
+              <span className="font-display text-base font-bold tracking-tight">LOODY</span>
             </button>
           </div>
 
-          {user ? (
-            <button
-              type="button"
-              onClick={() => setActiveView('settings')}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 dark:border-white/10 px-2.5 py-1.5 text-xs font-medium min-h-[36px] cursor-pointer"
-            >
-              <Settings className="w-3.5 h-3.5 text-emerald-500" />
-              <span className="max-w-[96px] truncate">{user.displayName}</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setAuthModalOpen(true)}
-              className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white min-h-[36px] cursor-pointer"
-            >
-              {t(language, 'signIn')}
-            </button>
+          {activeView !== 'chat' && (
+            <div className="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate">
+              {t(
+                language,
+                activeView === 'home'
+                  ? 'navHome'
+                  : activeView === 'models'
+                  ? 'navModels'
+                  : activeView === 'projects'
+                  ? 'navProjects'
+                  : activeView === 'files'
+                  ? 'navFiles'
+                  : activeView === 'memory'
+                  ? 'navMemory'
+                  : activeView === 'code'
+                  ? 'navCode'
+                  : activeView === 'work'
+                  ? 'navWork'
+                  : activeView === 'skills'
+                  ? 'navSkills'
+                  : activeView === 'research'
+                  ? 'navResearch'
+                  : activeView === 'creative'
+                  ? 'navCreative'
+                  : activeView === 'tools'
+                  ? 'navTools'
+                  : activeView === 'integrations'
+                  ? 'navIntegrations'
+                  : activeView === 'mcp'
+                  ? 'navMcp'
+                  : activeView === 'usage'
+                  ? 'navUsage'
+                  : activeView === 'settings'
+                  ? 'navSettings'
+                  : 'navHelp'
+              )}
+            </div>
           )}
         </header>
 
         {/* Active View Canvas */}
-        <main className="flex-1 min-h-0 overflow-y-auto pb-[64px] md:pb-0">
+        <main className="flex-1 min-h-0 overflow-y-auto">
           {activeView === 'home' && (
             <HomeView
               user={user}
@@ -464,8 +501,8 @@ export default function App() {
               onSelectConvId={setActiveConvId}
               onSelectModel={setActiveModelId}
               onSelectProject={setActiveProjectId}
-              onOpenSidebar={() => setSidebarOpen(true)}
               onOpenModelHub={() => setActiveView('models')}
+              onOpenIntegrations={() => setActiveView('integrations')}
               onOpenUsage={() => setActiveView('usage')}
               onOpenAuth={() => setAuthModalOpen(true)}
               onRefreshConversations={() => loadConversations(Boolean(user))}
@@ -647,35 +684,6 @@ export default function App() {
           )}
         </main>
 
-        {/* Mobile Bottom Tab Bar */}
-        <nav
-          aria-label="Mobile bottom navigation"
-          className="md:hidden fixed bottom-0 left-0 right-0 z-30 h-[60px] border-t border-zinc-200 dark:border-emerald-500/15 bg-white/95 dark:bg-[#070A08]/95 backdrop-blur-md grid grid-cols-5 items-center pb-safe"
-        >
-          {[
-            { id: 'chat', label: t(language, 'navChat'), icon: MessageSquare },
-            { id: 'models', label: t(language, 'navModels'), icon: Cpu },
-            { id: 'projects', label: t(language, 'navProjects'), icon: FolderKanban },
-            { id: 'tools', label: t(language, 'navTools'), icon: Wrench },
-            { id: 'settings', label: t(language, 'navSettings'), icon: Settings },
-          ].map((item) => {
-            const Icon = item.icon;
-            const active = activeView === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setActiveView(item.id as WorkspaceViewId)}
-                className={`flex flex-col items-center justify-center h-full min-h-[44px] text-[10px] font-medium transition-colors cursor-pointer ${
-                  active ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-500 dark:text-zinc-400'
-                }`}
-              >
-                <Icon className="w-5 h-5" />
-                <span className="mt-0.5 truncate max-w-[68px]">{item.label}</span>
-              </button>
-            );
-          })}
-        </nav>
       </div>
 
       <AuthModal

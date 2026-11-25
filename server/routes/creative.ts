@@ -12,7 +12,7 @@ import type { VideoTimelineClip } from '../../src/shared/types';
 import { DATA_DIR, db, recordAuditLog } from '../db';
 import { type AuthenticatedRequest, requireAuth } from '../middleware';
 import { generateModelText } from '../providers';
-import { createRateLimiter, inspectUploadedBinarySafety } from '../security';
+import { createRateLimiter, inspectUploadedBinarySafety, validateImageAttachmentBinary } from '../security';
 
 const execFileAsync = promisify(execFile);
 
@@ -132,10 +132,32 @@ creativeRouter.post('/assets', async (req: AuthenticatedRequest, res) => {
     return;
   }
 
-  const buffer = Buffer.from(parsed.data.dataBase64, 'base64');
+  const normalizedBase64 = parsed.data.dataBase64.replace(/\s+/g, '');
+  if (!normalizedBase64 || normalizedBase64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(normalizedBase64)) {
+    res.status(400).json({ error: 'Malformed base64 media payload.' });
+    return;
+  }
+
+  const buffer = Buffer.from(normalizedBase64, 'base64');
+  if (buffer.length === 0) {
+    res.status(400).json({ error: 'Empty (0-byte) media assets cannot be uploaded.' });
+    return;
+  }
   if (buffer.length > 12 * 1024 * 1024) {
     res.status(400).json({ error: 'Media asset exceeds 12MB upload limit.' });
     return;
+  }
+
+  if (parsed.data.kind === 'image') {
+    const imgCheck = validateImageAttachmentBinary({
+      mimeType: parsed.data.mimeType,
+      dataBase64: normalizedBase64,
+      name: parsed.data.name,
+    });
+    if (!imgCheck.valid) {
+      res.status(400).json({ error: imgCheck.reason ?? 'Invalid image binary payload.', code: 'INVALID_IMAGE_BINARY' });
+      return;
+    }
   }
 
   const safety = inspectUploadedBinarySafety({
@@ -189,7 +211,11 @@ creativeRouter.get('/assets/:id/download', (req: AuthenticatedRequest, res) => {
     res.status(404).json({ error: 'Media binary missing.' });
     return;
   }
+  const safeAssetName = String(row.name).replace(/["\r\n]/g, '_');
   res.setHeader('Content-Type', String(row.mime_type));
+  res.setHeader('Content-Security-Policy', 'sandbox');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `inline; filename="${safeAssetName}"`);
   res.setHeader('Cache-Control', 'private, max-age=3600');
   fs.createReadStream(full).pipe(res);
 });
@@ -520,6 +546,8 @@ creativeRouter.get('/projects/:id/download', (req: AuthenticatedRequest, res) =>
   }
   const safeName = String(row.title).toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'loody-video';
   res.setHeader('Content-Type', String(row.mime_type ?? 'video/mp4'));
+  res.setHeader('Content-Security-Policy', 'sandbox');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp4"`);
   fs.createReadStream(full).pipe(res);
 });

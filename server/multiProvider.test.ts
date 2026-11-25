@@ -708,3 +708,197 @@ test('Controlled mocked /chat/stream concurrency benchmark (1, 2, 5)', async () 
     await new Promise<void>((resolve) => srv.close(() => resolve()));
   }
 });
+
+test('OpenRouter & DeepInfra: attribution headers, genuine upstream attribution/cost persistence, VLM vision, bounded retry, and unconfigured handling', async () => {
+  const srv = http.createServer(app);
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+  const port = (srv.address() as { port: number }).port;
+  const apiUrl = `http://127.0.0.1:${port}`;
+  const orchMod = await import('./orchestratorRuntime');
+
+  try {
+    // 1. Unconfigured OpenRouter & DeepInfra return awaiting_config cleanly without crashing
+    clearProviderEnvs();
+    const orUnconf = await testProviderConnection(
+      makeModel({ id: 'sonic-3', provider: 'openrouter', upstreamModelId: 'nvidia/nemotron-3.5-lightning:free' })
+    );
+    assert.equal(orUnconf.ok, false);
+    assert.equal(orUnconf.healthStatus, 'awaiting_config');
+    assert.equal(orUnconf.errorClass, 'configuration_error');
+
+    const diUnconf = await testProviderConnection(
+      makeModel({ id: 'sonic-3', provider: 'deepinfra', upstreamModelId: 'Qwen/Qwen3.8-Flash' })
+    );
+    assert.equal(diUnconf.ok, false);
+    assert.equal(diUnconf.healthStatus, 'awaiting_config');
+
+    // 2. DeepInfra VLM image attachment succeeds while text-only DeepInfra rejects images (HTTP 400 validation_error)
+    await assert.rejects(
+      streamModelResponse({
+        model: makeModel({
+          id: 'sonic-3',
+          provider: 'deepinfra',
+          upstreamModelId: 'Qwen/Qwen3.8-Flash',
+          inputModalities: ['text'],
+        }),
+        messages: [
+          {
+            role: 'user',
+            content: 'Inspect',
+            attachments: [{ mimeType: 'image/png', dataBase64: 'AAAA', name: 'img.png', sizeBytes: 4 }],
+          },
+        ],
+        callbacks: { onChunk: () => {} },
+      }),
+      (err: any) => err?.errorClass === 'validation_error' && err?.httpStatus === 400
+    );
+
+    // 3. OpenAI-compatible bounded retry recovers cleanly from a transient 503 before emitting chunks, and never leaks attribution when absent
+    let diHits = 0;
+    await withLoopbackServer((req, res) => {
+      diHits++;
+      if (diHits === 1) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Temporary DeepInfra capacity overload' } }));
+        return;
+      }
+      let raw = '';
+      req.on('data', (c) => (raw += c));
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write('data: {"choices":[{"delta":{"content":"DeepInfra VLM OK"}}]}\n\n');
+        res.write('data: {"choices":[],"usage":{"prompt_tokens":15,"completion_tokens":4}}\n\n');
+        res.end('data: [DONE]\n\n');
+      });
+    }, async (diBase) => {
+      process.env.DEEPINFRA_API_KEY = 'secret-deepinfra-test-key';
+      process.env.DEEPINFRA_BASE_URL = diBase;
+      try {
+        let diText = '';
+        let diAttrib: string | undefined;
+        await streamModelResponse({
+          model: makeModel({
+            id: 'loody-vision-1',
+            provider: 'deepinfra',
+            upstreamModelId: 'nvidia/NVIDIA-Nemotron-3.5-Super-VL',
+            inputModalities: ['text', 'image'],
+          }),
+          maxAttempts: 2,
+          messages: [
+            {
+              role: 'user',
+              content: 'Analyze pixel',
+              attachments: [{ mimeType: 'image/png', dataBase64: 'AAAA', name: 'img.png', sizeBytes: 4 }],
+            },
+          ],
+          callbacks: {
+            onChunk: (c) => (diText += c),
+            onProviderMeta: (m) => {
+              diAttrib = m.upstreamAttribution;
+            },
+          },
+        });
+        assert.equal(diHits, 2);
+        assert.equal(diText, 'DeepInfra VLM OK');
+        assert.equal(diAttrib, undefined);
+      } finally {
+        clearProviderEnvs();
+      }
+    });
+
+    // 4. OpenRouter sends HTTP-Referer + X-OpenRouter-Title, captures genuine upstream provider & usage.cost into messages + token_usage, and blocks secret leaks
+    let seenHeaders: Record<string, string | string[] | undefined> = {};
+    await withLoopbackServer((req, res) => {
+      seenHeaders = req.headers;
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(
+        'data: {"id":"gen-or-123","provider":"DeepInfra","choices":[{"delta":{"content":"OpenRouter Real Route OK"}}]}\n\n'
+      );
+      res.write(
+        'data: {"id":"gen-or-123","provider":"DeepInfra","choices":[],"usage":{"prompt_tokens":22,"completion_tokens":8,"cost":0.000125}}\n\n'
+      );
+      res.end('data: [DONE]\n\n');
+    }, async (orBase) => {
+      clearProviderEnvs();
+      orchMod.resetProviderCircuit('openrouter');
+      process.env.APP_URL = 'https://loody.example.com';
+      process.env.OPENROUTER_API_KEY = 'secret-openrouter-do-not-leak';
+      process.env.OPENROUTER_BASE_URL = orBase;
+      db.prepare(
+        "UPDATE model_registry SET provider = 'openrouter', upstream_model_id = 'qwen/qwen3.8-flash', availability = 'operational' WHERE id = 'fables-5.3'"
+      ).run();
+
+      try {
+        const email = `or-di-${Date.now()}@loody.test`;
+        const regRes = await fetch(`${apiUrl}/api/v1/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password: 'TestPassword123!', displayName: 'OR Tester' }),
+        });
+        assert.equal(regRes.status, 201);
+        const cookie = regRes.headers.get('set-cookie')?.split(';')[0] ?? '';
+
+        const chatRes = await fetch(`${apiUrl}/api/v1/chat/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: cookie },
+          body: JSON.stringify({
+            modelId: 'fables-5.3',
+            prompt: 'Hello OpenRouter',
+            orchestrationMode: 'creative',
+          }),
+        });
+        assert.equal(chatRes.status, 200);
+        const sse = await chatRes.text();
+        assert.equal(seenHeaders.authorization, 'Bearer secret-openrouter-do-not-leak');
+        assert.equal(seenHeaders['http-referer'], 'https://loody.example.com');
+        assert.equal(seenHeaders['x-openrouter-title'], 'LOODY AI Workspace');
+        assert.equal(sse.includes('secret-openrouter-do-not-leak'), false);
+        assert.match(sse, /OpenRouter Real Route OK/);
+        assert.match(sse, /"upstreamAttribution":"DeepInfra"/);
+        assert.match(sse, /"estimatedCostUsd":0\.000125/);
+
+        const msgRow = db
+          .prepare(
+            "SELECT model_id, provider, upstream_model_id, upstream_attribution FROM messages WHERE role = 'assistant' ORDER BY created_at DESC LIMIT 1"
+          )
+          .get() as {
+          model_id: string;
+          provider: string;
+          upstream_model_id: string;
+          upstream_attribution: string | null;
+        };
+        assert.equal(msgRow.model_id, 'fables-5.3');
+        assert.equal(msgRow.provider, 'openrouter');
+        assert.equal(msgRow.upstream_model_id, 'qwen/qwen3.8-flash');
+        assert.equal(msgRow.upstream_attribution, 'DeepInfra');
+
+        const usageRow = db
+          .prepare(
+            'SELECT model_id, provider, upstream_model_id, upstream_attribution, latency_ms, fallback_attempts, estimated_cost_usd FROM token_usage ORDER BY created_at DESC LIMIT 1'
+          )
+          .get() as {
+          model_id: string;
+          provider: string;
+          upstream_model_id: string;
+          upstream_attribution: string | null;
+          latency_ms: number | null;
+          fallback_attempts: number;
+          estimated_cost_usd: number;
+        };
+        assert.equal(usageRow.model_id, 'fables-5.3');
+        assert.equal(usageRow.provider, 'openrouter');
+        assert.equal(usageRow.upstream_model_id, 'qwen/qwen3.8-flash');
+        assert.equal(usageRow.upstream_attribution, 'DeepInfra');
+        assert.ok((usageRow.latency_ms ?? 0) >= 1);
+        assert.equal(usageRow.fallback_attempts, 1);
+        assert.equal(usageRow.estimated_cost_usd, 0.000125);
+      } finally {
+        delete process.env.APP_URL;
+        clearProviderEnvs();
+        orchMod.resetProviderCircuit('openrouter');
+      }
+    });
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+  }
+});

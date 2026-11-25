@@ -16,6 +16,7 @@ import {
   Send,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import { toSafeMarkdownUrl } from '../shared/safeUrl';
 import type { DocumentAttachment, FileCategory, PublicUser, WorkspaceFileRecord } from '../shared/types';
 
 interface FilesViewProps {
@@ -478,7 +479,9 @@ export const FilesView: React.FC<FilesViewProps> = ({ user, onUseInChat, onOpenA
               <div className="rounded-xl border border-emerald-500/25 bg-emerald-50/40 dark:bg-[#050706] p-3.5 text-xs space-y-1">
                 <div className="font-semibold text-emerald-700 dark:text-emerald-400">AI Executive Summary</div>
                 <div className="prose prose-zinc dark:prose-invert prose-xs max-w-none">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{previewFile.summary}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={toSafeMarkdownUrl}>
+                    {previewFile.summary}
+                  </ReactMarkdown>
                 </div>
               </div>
             )}
@@ -510,7 +513,9 @@ export const FilesView: React.FC<FilesViewProps> = ({ user, onUseInChat, onOpenA
 
                 {analysisResult && (
                   <div className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] p-4 prose prose-zinc dark:prose-invert prose-xs max-w-none">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysisResult}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={toSafeMarkdownUrl}>
+                      {analysisResult}
+                    </ReactMarkdown>
                   </div>
                 )}
               </>
@@ -588,7 +593,9 @@ export const FilesView: React.FC<FilesViewProps> = ({ user, onUseInChat, onOpenA
 
             {compareResult && (
               <div className="rounded-xl border border-zinc-200 dark:border-white/10 bg-zinc-50 dark:bg-[#050706] p-4 prose prose-zinc dark:prose-invert prose-xs max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{compareResult}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={toSafeMarkdownUrl}>
+                  {compareResult}
+                </ReactMarkdown>
               </div>
             )}
           </div>

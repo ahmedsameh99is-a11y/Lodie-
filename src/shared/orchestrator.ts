@@ -89,8 +89,12 @@ export function classifyProviderError(
   }
 
   if (
+    httpStatus === 402 ||
     lower.includes('insufficient_quota') ||
     lower.includes('credit balance') ||
+    lower.includes('positive balance') ||
+    lower.includes('insufficient credits') ||
+    lower.includes('top-up') ||
     lower.includes('billing hard limit') ||
     lower.includes('limit: 0') ||
     (httpStatus !== 429 && (lower.includes('quota') || lower.includes('billing')))

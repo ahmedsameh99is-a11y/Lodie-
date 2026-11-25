@@ -9,10 +9,10 @@ import {
   MODEL_COMPATIBILITY_MATRIX,
 } from './providerMatrix';
 
-test('compatibility matrix covers all 5 branded LOODY models with <=10 verified routes each', () => {
+test('compatibility matrix covers all 5 branded LOODY models with <=12 verified routes including OpenRouter & DeepInfra', () => {
   for (const modelId of REQUIRED_BRANDED_MODEL_IDS) {
     const routes = getCompatibilityRoutesForModel(modelId);
-    assert.ok(routes.length >= 9 && routes.length <= 10, `${modelId} has unexpected route count: ${routes.length}`);
+    assert.ok(routes.length >= 9 && routes.length <= 12, `${modelId} has unexpected route count: ${routes.length}`);
     // Unique provider+upstream pairs per model
     const keys = new Set(routes.map((r) => `${r.provider}::${r.upstreamModelId}`));
     assert.equal(keys.size, routes.length, `Duplicate route detected in ${modelId}`);
@@ -21,11 +21,20 @@ test('compatibility matrix covers all 5 branded LOODY models with <=10 verified 
       routes.some((r) => r.supportsVision),
       `${modelId} must have at least one vision-capable route`
     );
+    // OpenRouter and DeepInfra are represented cleanly across all 5 branded models
+    assert.ok(
+      routes.some((r) => r.provider === 'openrouter'),
+      `${modelId} must include an OpenRouter candidate route`
+    );
+    assert.ok(
+      routes.some((r) => r.provider === 'deepinfra'),
+      `${modelId} must include a DeepInfra candidate route`
+    );
   }
   assert.equal(Object.keys(MODEL_COMPATIBILITY_MATRIX).length, 5);
 });
 
-test('compatibility matrix never assigns retired github-models or routes images to text-only groq primary', () => {
+test('compatibility matrix never assigns retired github-models or routes images to text-only groq/deepinfra routes', () => {
   const all = getAllMatrixRoutes();
   assert.equal(
     all.some((r) => r.provider === 'github-models'),
@@ -38,6 +47,24 @@ test('compatibility matrix never assigns retired github-models or routes images 
     assert.equal(route.supportsVision, true, `Non-vision route ${route.id} found in loody-vision-1`);
     assert.notEqual(route.provider, 'groq', 'Groq text-only catalog must not appear in loody-vision-1');
   }
+
+  // DeepInfra text-only route on sonic-3 must be skipped for image attachments
+  const sonic3PlanWithImg = planProviderRoutes({
+    brandedModelId: 'sonic-3',
+    routes: getCompatibilityRoutesForModel('sonic-3'),
+    providerStatus: {
+      deepinfra: { configured: true, retired: false, dailyBudgetUsd: 10, todaySpendUsd: 0, dailyRequestCap: 100, todayRequests: 0 },
+      gemini: { configured: true, retired: false, dailyBudgetUsd: 10, todaySpendUsd: 0, dailyRequestCap: 100, todayRequests: 0 },
+    },
+    circuitBreaker: new CircuitBreakerRegistry(),
+    hasImageAttachments: true,
+    requiresStreaming: true,
+    estimatedInputTokens: 200,
+    intentMode: 'auto',
+    promptLanguage: 'en',
+  });
+  assert.equal(sonic3PlanWithImg.candidates.some((c) => c.route.provider === 'deepinfra'), false);
+  assert.equal(sonic3PlanWithImg.candidates[0].route.provider, 'gemini');
 
   // When sonic-3 or fables-5.3 has groq as fast text primary and an image is attached, planner must skip groq & pick vision routes
   for (const modelId of ['sonic-3', 'fables-5.3'] as const) {

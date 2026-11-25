@@ -17,6 +17,12 @@ export interface StreamCallbacks {
     inputTokens?: number;
     outputTokens?: number;
     cachedTokens?: number;
+    reportedCostUsd?: number;
+  }) => void;
+  onProviderMeta?: (meta: {
+    upstreamAttribution?: string;
+    reportedCostUsd?: number;
+    responseId?: string;
   }) => void;
 }
 
@@ -613,135 +619,180 @@ export async function streamModelResponse(params: {
       ? baseUrl
       : `${baseUrl.replace(/\/$/, '')}/chat/completions`;
 
-    const attemptStart = Date.now();
-    const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
-    let resp: Response;
-    try {
-      resp = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-          ...(catalogEntry.extraHeaders?.() ?? {}),
-        },
-        body: JSON.stringify({
-          model: model.upstreamModelId,
-          messages: formattedMessages,
-          stream: true,
-          ...(catalogEntry.supportsStreamOptionsUsage ? { stream_options: { include_usage: true } } : {}),
-          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-        }),
-        signal: attemptSignal,
-      });
-    } catch (err) {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) return;
-      const timeoutErr = normalizeTimeoutOrAbortError({
-        err,
-        model,
-        timeoutMs,
-        userSignal: signal,
-        timeoutSignal,
-      });
-      if (timeoutErr) throw timeoutErr;
-      const info = extractReadableError(err);
-      const cls = classifyProviderError(info.message);
-      throw new ProviderExecutionError(`${model.displayName} (${catalogEntry.displayName}): ${info.message}`, { ...cls });
-    }
+      const attemptStart = Date.now();
+      let emittedChunk = false;
+      let reportedAttribution: string | undefined;
+      let reportedCostUsd: number | undefined;
+      let reportedResponseId: string | undefined;
+      const { signal: attemptSignal, timeoutSignal } = createAttemptSignal(signal, timeoutMs);
 
-    if (!resp.ok || !resp.body) {
-      const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'));
-      const errText = await resp.text().catch(() => resp.statusText);
-      const info = extractReadableError(errText);
-      const cls = classifyProviderError(info.message || errText, resp.status);
-      throw new ProviderExecutionError(
-        `${model.displayName} (${catalogEntry.displayName}) upstream error (${resp.status}): ${info.message || errText}`,
-        {
-          ...cls,
-          httpStatus: resp.status,
-          retryAfterMs,
-        }
-      );
-    }
-
-    let emittedChunk = false;
-    const processOpenAiLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) return;
-      const dataStr = trimmed.slice(5).trim();
-      if (!dataStr || dataStr === '[DONE]') return;
-      let parsed: Record<string, any>;
       try {
-        parsed = JSON.parse(dataStr) as Record<string, any>;
-      } catch {
-        return;
-      }
-      if (parsed.error) {
-        const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
-        const cls = classifyProviderError(msg);
-        throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls, partialEmitted: emittedChunk });
-      }
-      const delta = parsed.choices?.[0]?.delta?.content;
-      if (typeof delta === 'string' && delta.length > 0) {
-        if (!emittedChunk) {
-          emittedChunk = true;
-          callbacks.onFirstToken?.(Date.now() - attemptStart);
-        }
-        callbacks.onChunk(delta);
-      } else if (Array.isArray(delta)) {
-        const combined = delta
-          .map((item) => (typeof item?.text === 'string' ? item.text : ''))
-          .join('');
-        if (combined.length > 0) {
-          if (!emittedChunk) {
-            emittedChunk = true;
-            callbacks.onFirstToken?.(Date.now() - attemptStart);
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            ...(catalogEntry.extraHeaders?.() ?? {}),
+          },
+          body: JSON.stringify({
+            model: model.upstreamModelId,
+            messages: formattedMessages,
+            stream: true,
+            ...(catalogEntry.supportsStreamOptionsUsage ? { stream_options: { include_usage: true } } : {}),
+            ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+          }),
+          signal: attemptSignal,
+        });
+
+        if (!resp.ok || !resp.body) {
+          const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'));
+          const errText = await resp.text().catch(() => resp.statusText);
+          const info = extractReadableError(errText);
+          const cls = classifyProviderError(info.message || errText, resp.status);
+          const httpErr = new ProviderExecutionError(
+            `${model.displayName} (${catalogEntry.displayName}) upstream error (${resp.status}): ${info.message || errText}`,
+            {
+              ...cls,
+              httpStatus: resp.status,
+              retryAfterMs,
+            }
+          );
+          if (httpErr.retryable && attempt < maxAttempts - 1) {
+            const backoffMs = Math.min(retryAfterMs ?? 400 * (attempt + 1), 2_000);
+            await sleep(backoffMs, signal);
+            lastErr = httpErr;
+            continue;
           }
-          callbacks.onChunk(combined);
+          throw httpErr;
         }
-      }
-      if (parsed.usage) {
-        callbacks.onUsage?.({
-          inputTokens: parsed.usage.prompt_tokens,
-          outputTokens: parsed.usage.completion_tokens,
-          cachedTokens: parsed.usage.prompt_tokens_details?.cached_tokens ?? 0,
+
+        const headerProvider = resp.headers.get('x-openrouter-provider')?.trim();
+        if (headerProvider) {
+          reportedAttribution = headerProvider;
+        }
+
+        const processOpenAiLine = (line: string) => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) return;
+          const dataStr = trimmed.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') return;
+          let parsed: Record<string, any>;
+          try {
+            parsed = JSON.parse(dataStr) as Record<string, any>;
+          } catch {
+            return;
+          }
+          if (parsed.error) {
+            const msg = String(parsed.error?.message ?? JSON.stringify(parsed.error));
+            const cls = classifyProviderError(msg);
+            throw new ProviderExecutionError(`${model.displayName}: ${msg}`, { ...cls, partialEmitted: emittedChunk });
+          }
+          if (typeof parsed.id === 'string' && parsed.id.trim() && !reportedResponseId) {
+            reportedResponseId = parsed.id.trim();
+          }
+          if (typeof parsed.provider === 'string' && parsed.provider.trim() && !reportedAttribution) {
+            reportedAttribution = parsed.provider.trim();
+          }
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string' && delta.length > 0) {
+            if (!emittedChunk) {
+              emittedChunk = true;
+              callbacks.onFirstToken?.(Date.now() - attemptStart);
+            }
+            callbacks.onChunk(delta);
+          } else if (Array.isArray(delta)) {
+            const combined = delta
+              .map((item) => (typeof item?.text === 'string' ? item.text : ''))
+              .join('');
+            if (combined.length > 0) {
+              if (!emittedChunk) {
+                emittedChunk = true;
+                callbacks.onFirstToken?.(Date.now() - attemptStart);
+              }
+              callbacks.onChunk(combined);
+            }
+          }
+          if (parsed.usage) {
+            const rawCost = parsed.usage.cost;
+            const parsedCost =
+              typeof rawCost === 'number' && Number.isFinite(rawCost) && rawCost >= 0 ? rawCost : undefined;
+            if (parsedCost !== undefined) {
+              reportedCostUsd = parsedCost;
+            }
+            callbacks.onUsage?.({
+              inputTokens: parsed.usage.prompt_tokens,
+              outputTokens: parsed.usage.completion_tokens,
+              cachedTokens: parsed.usage.prompt_tokens_details?.cached_tokens ?? 0,
+              ...(parsedCost !== undefined ? { reportedCostUsd: parsedCost } : {}),
+            });
+          }
+        };
+
+        await readSseLines(resp.body, processOpenAiLine);
+
+        if (!emittedChunk && !signal?.aborted) {
+          throw new ProviderExecutionError(
+            `${model.displayName} (${catalogEntry.displayName}) returned an empty probe response.`,
+            {
+              errorClass: 'provider_unavailable',
+              healthStatus: 'temporarily_unavailable',
+              retryable: true,
+            }
+          );
+        }
+
+        if (reportedAttribution || reportedCostUsd !== undefined || reportedResponseId) {
+          callbacks.onProviderMeta?.({
+            ...(reportedAttribution ? { upstreamAttribution: reportedAttribution } : {}),
+            ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
+            ...(reportedResponseId ? { responseId: reportedResponseId } : {}),
+          });
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (signal?.aborted) return;
+        const timeoutErr = normalizeTimeoutOrAbortError({
+          err,
+          model,
+          timeoutMs,
+          userSignal: signal,
+          timeoutSignal,
+          partialEmitted: emittedChunk,
+        });
+        if (timeoutErr) {
+          if (!emittedChunk && attempt < maxAttempts - 1) {
+            await sleep(400, signal);
+            continue;
+          }
+          throw timeoutErr;
+        }
+        if (err instanceof ProviderExecutionError) {
+          err.partialEmitted = emittedChunk;
+          if (!emittedChunk && err.retryable && attempt < maxAttempts - 1) {
+            const backoffMs = Math.min(err.retryAfterMs ?? 400 * (attempt + 1), 2_000);
+            await sleep(backoffMs, signal);
+            continue;
+          }
+          throw err;
+        }
+        const info = extractReadableError(err);
+        const cls = classifyProviderError(info.message);
+        if (!emittedChunk && cls.retryable && attempt < maxAttempts - 1) {
+          await sleep(400, signal);
+          continue;
+        }
+        throw new ProviderExecutionError(`${model.displayName} (${catalogEntry.displayName}): ${info.message}`, {
+          ...cls,
+          partialEmitted: emittedChunk,
         });
       }
-    };
-
-    try {
-      await readSseLines(resp.body, processOpenAiLine);
-    } catch (err) {
-      if (signal?.aborted) return;
-      if (err instanceof ProviderExecutionError) {
-        err.partialEmitted = emittedChunk;
-        throw err;
-      }
-      const timeoutErr = normalizeTimeoutOrAbortError({
-        err,
-        model,
-        timeoutMs,
-        userSignal: signal,
-        timeoutSignal,
-        partialEmitted: emittedChunk,
-      });
-      if (timeoutErr) throw timeoutErr;
-      const info = extractReadableError(err);
-      const cls = classifyProviderError(info.message);
-      throw new ProviderExecutionError(`${model.displayName}: ${info.message}`, {
-        ...cls,
-        partialEmitted: emittedChunk,
-      });
     }
-
-    if (!emittedChunk && !signal?.aborted) {
-      throw new ProviderExecutionError(
-        `${model.displayName} (${catalogEntry.displayName}) returned an empty probe response.`,
-        {
-          errorClass: 'provider_unavailable',
-          healthStatus: 'temporarily_unavailable',
-          retryable: true,
-        }
-      );
+    if (lastErr instanceof Error) {
+      throw lastErr;
     }
     return;
   }
@@ -1077,11 +1128,13 @@ export async function testProviderConnection(
   retryAfterMs?: number;
   message: string;
   sampleText?: string;
-  usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number };
+  upstreamAttribution?: string;
+  usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; reportedCostUsd?: number };
 }> {
   const start = Date.now();
   let ttftMs: number | null = null;
-  let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } | undefined;
+  let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; reportedCostUsd?: number } | undefined;
+  let upstreamAttribution: string | undefined;
   let sampleText = '';
 
   const probeModel: BrandedModel = {
@@ -1120,6 +1173,11 @@ export async function testProviderConnection(
         onUsage: (u) => {
           usage = u;
         },
+        onProviderMeta: (meta) => {
+          if (meta.upstreamAttribution) {
+            upstreamAttribution = meta.upstreamAttribution;
+          }
+        },
       },
     });
     const latencyMs = Date.now() - start;
@@ -1138,9 +1196,10 @@ export async function testProviderConnection(
       healthStatus,
       errorClass: ok ? null : 'provider_unavailable',
       message: ok
-        ? `Verified live response from ${model.provider}/${model.upstreamModelId} (${latencyMs}ms)`
+        ? `Verified live response from ${model.provider}/${model.upstreamModelId}${upstreamAttribution ? ` via ${upstreamAttribution}` : ''} (${latencyMs}ms)`
         : `${model.displayName} returned an empty probe response.`,
       sampleText: sampleText.trim().slice(0, 400),
+      ...(upstreamAttribution ? { upstreamAttribution } : {}),
       usage,
     };
   } catch (err) {

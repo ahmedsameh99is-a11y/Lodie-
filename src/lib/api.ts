@@ -49,6 +49,7 @@ import type {
   ChatStreamDoneEvent,
   ChatStreamErrorEventMeta,
   ChatStreamMetaEvent,
+  ChatStreamStatusEvent,
 } from '../shared/chatStream';
 import { consumeSseReadableStream } from '../shared/chatStream';
 import { getActiveFirebaseIdToken } from './firebase';
@@ -962,6 +963,7 @@ export async function streamChat(params: {
   attachments?: ChatAttachment[];
   signal: AbortSignal;
   onMeta: (meta: ChatStreamMetaEvent) => void;
+  onStatus?: (status: ChatStreamStatusEvent) => void;
   onChunk: (text: string) => void;
   onDone: (done: ChatStreamDoneEvent) => void;
   onError: (err: string, meta?: ChatStreamErrorEventMeta) => void;
@@ -1021,6 +1023,13 @@ export async function streamChat(params: {
           clientTimings.firstEventMs = Math.round(performance.now() - tRequestStart);
         }
         params.onMeta(meta);
+      },
+      onStatus: (status) => {
+        if (!firstEventRecorded) {
+          firstEventRecorded = true;
+          clientTimings.firstEventMs = Math.round(performance.now() - tRequestStart);
+        }
+        params.onStatus?.(status);
       },
       onChunk: (text) => {
         if (!firstChunkRecorded) {

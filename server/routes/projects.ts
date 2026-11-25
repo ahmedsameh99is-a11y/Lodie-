@@ -309,6 +309,7 @@ projectsRouter.post('/:id/files', projectFileLimiter, async (req: AuthenticatedR
   const userId = req.authUser!.id;
   const storageRelPath = buffer ? saveUserBinaryFile({ userId, fileId: id, buffer }) : null;
 
+  const verifiedSizeBytes = buffer.length;
   try {
     db.prepare(`
       INSERT INTO project_files (id, project_id, user_id, name, mime_type, size_bytes, extracted_text, storage_rel_path, file_category, created_at)
@@ -319,7 +320,7 @@ projectsRouter.post('/:id/files', projectFileLimiter, async (req: AuthenticatedR
       userId,
       parsed.data.name,
       parsed.data.mimeType,
-      parsed.data.sizeBytes,
+      verifiedSizeBytes,
       extracted.extractedText,
       storageRelPath,
       extracted.fileCategory,
@@ -349,7 +350,7 @@ projectsRouter.post('/:id/files', projectFileLimiter, async (req: AuthenticatedR
       userId,
       name: parsed.data.name,
       mimeType: parsed.data.mimeType,
-      sizeBytes: parsed.data.sizeBytes,
+      sizeBytes: verifiedSizeBytes,
       extractedText: extracted.extractedText,
       fileCategory: extracted.fileCategory,
       hasBinary: Boolean(storageRelPath),
@@ -368,8 +369,11 @@ projectsRouter.get('/:id/files/:fileId/download', (req: AuthenticatedRequest, re
   }
 
   const safeName = String(row.name).replace(/["\r\n]/g, '_');
-  const mime = String(row.mime_type || 'application/octet-stream');
-  const inline = req.query.inline === '1';
+  const rawMime = String(row.mime_type || 'application/octet-stream').toLowerCase();
+  const isScriptable =
+    /(html|svg|javascript|ecmascript|xhtml)/i.test(rawMime) || /\.(html?|svg|xhtml|mjs|js)$/i.test(safeName);
+  const mime = isScriptable ? 'text/plain; charset=utf-8' : rawMime;
+  const inline = req.query.inline === '1' && !isScriptable;
 
   res.setHeader('Content-Type', mime);
   res.setHeader('Content-Security-Policy', 'sandbox');
